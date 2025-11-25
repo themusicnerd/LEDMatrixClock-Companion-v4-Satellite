@@ -83,7 +83,7 @@ which means it can be driven by: Variables & Custom Actions!
 - Enter flash mode
 - Hold DOWNLOAD → tap RESET → release.
 
-###Enter config portal
+### Enter config portal
 - Either:
   - Hold DOWNLOAD during power-on, or
   - Allow 5 failed Wi-Fi attempts in a row.
