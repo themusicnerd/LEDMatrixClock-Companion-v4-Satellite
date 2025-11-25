@@ -27,16 +27,14 @@ The device boots and attempts Wi-Fi and Companion automatically.
 
 ## Entering Config Portal
 
-The config portal starts if:
-
-1. Wi-Fi fails 5 boots in a row, OR
-2. You hold DOWNLOAD during power-on
-
-When active, the LED matrix shows:
-
-CONFIG
-192.168.4.1
-
+On boot if you see CONFIG? and you reset while it is scrolling, you will enter WiFi Manager config mode.
+- Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
+- It should take you to 192.168.4.1 (if not, go there)
+- Setup the Companion IP, Companion Port, and set Boot to 0
+- Save
+- Hit BACK in your browser to get to the main menu (may be more than once)
+- Setup Wifi
+- Save and exit
 
 ## Connect to the Wi-Fi network:
 
