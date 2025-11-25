@@ -56,8 +56,8 @@ bool textScrolls = false;
 const uint16_t scrollSpeed = 40;     // Lower = slower
 const uint16_t scrollPause = 0;      // Pause at end of scroll
 
-bool testMode = true;   // start in test mode for a few seconds
-unsigned long testStart = 0;
+// NEW: boot prompt timing
+const unsigned long CONFIG_PROMPT_MS = 5000;
 
 // ------------------------ COMPANION CONFIG ------------------
 
@@ -94,10 +94,11 @@ const unsigned long connectRetryMs  = 5000;
 const unsigned long pingIntervalMs  = 2000;
 
 // How many failed boots before forcing config portal
-const uint8_t BOOT_FAIL_LIMIT = 5;
+// Only need one as it holds the CONFIG? scrolling text for that part.
+const uint8_t BOOT_FAIL_LIMIT = 1;
 
 // Brightness (0–100 from Companion)
-int brightness = 100;
+int brightness = 30;
 
 // ------------------------ TEXT STATE ------------------------
 
@@ -468,12 +469,8 @@ void connectToNetwork() {
   // Load Companion config from EEPROM
   eepromLoadCompanionConfig();
 
-  // Increment boot counter as early as possible
+  // Read boot counter (already incremented in setup())
   uint8_t bootCount = eepromReadBootCounter();
-  if (bootCount < 255) {
-    bootCount++;
-  }
-  eepromWriteBootCounter(bootCount);
   Serial.printf("[Boot] Boot counter = %u\n", bootCount);
 
   // Prepare WiFiManager with params
@@ -567,18 +564,33 @@ void setup() {
   // If it ever looks upside-down, you can also try:
   // P.setZoneEffect(0, true, PA_FLIP_UD);
 
-  // Quick visual tests
-  P.displayText("48:00", PA_CENTER, scrollSpeed, scrollPause, PA_PRINT, PA_PRINT);
-  P.displayReset();
-  delay(3000);
+  // --------------------------------------------------------
+  // NEW: Boot counter increment and BOOT → CONFIG? prompt
+  // --------------------------------------------------------
+  uint8_t bootCount = eepromReadBootCounter();
+  if (bootCount < 255) {
+    bootCount++;
+  }
+  eepromWriteBootCounter(bootCount);
+  Serial.printf("[Boot] Boot counter (pre-wifi) = %u\n", bootCount);
 
-  P.displayText("1234", PA_CENTER, scrollSpeed, scrollPause, PA_PRINT, PA_PRINT);
-  P.displayReset();
+  // Show "BOOT" for 1 second
+  showBootMessage("BOOT");
+  delay(1000);
 
-  testStart = millis();
-  testMode  = true;
-
-  showBootMessage("BOOTING\nLED MATRIX");
+  // Show "CONFIG?" and sit there for 5 seconds.
+  // If the user hits reset during this, bootCount will climb and
+  // eventually trigger the config portal on the next boot.
+  showBootMessage("CONFIG?");
+  unsigned long cfgPromptStart = millis();
+  while (millis() - cfgPromptStart < CONFIG_PROMPT_MS) {
+    if (P.displayAnimate()) {
+      if (textScrolls) {
+        P.displayReset();
+      }
+    }
+    yield();  // keep the watchdog happy
+  }
 
   // WiFi + config (with boot counter logic)
   connectToNetwork();
@@ -605,18 +617,6 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // --- TEST MODE: keep simple text for 5 seconds on boot ---
-  if (testMode) {
-    if (P.displayAnimate()) {
-      P.displayReset();   // keep it static/looping
-    }
-    if (now - testStart > 5000) {
-      testMode = false;
-      P.displayClear();
-    }
-    return;   // don't run the Companion logic while in test mode
-  }
-
   // Attempt Companion connection if not connected
   if (!client.connected() && (now - lastConnectTry >= connectRetryMs)) {
     lastConnectTry = now;
@@ -629,7 +629,7 @@ void loop() {
     if (client.connect(companion_host, atoi(companion_port))) {
       Serial.println("[NET] Connected to Companion API");
       showBootMessage("Connected");
-      delay(200);
+      delay(500);
       sendAddDevice();
       lastPingTime = millis();
       // Show waiting text until Companion sends first TEXT
