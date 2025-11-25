@@ -22,8 +22,8 @@
   Config behaviour:
     - WiFi fails => WiFiManager config portal (standard)
     - Companion down => keep retrying, NO config portal
-    - 5 rapid resets before successful WiFi connection =>
-      boot counter triggers config portal
+    - Reset during 5s "CONFIG?" window =>
+      next boot triggers config portal via boot counter
   ------------------------------------------------------------
 */
 
@@ -56,7 +56,7 @@ bool textScrolls = false;
 const uint16_t scrollSpeed = 40;     // Lower = slower
 const uint16_t scrollPause = 0;      // Pause at end of scroll
 
-// NEW: boot prompt timing
+// Boot prompt timing
 const unsigned long CONFIG_PROMPT_MS = 5000;
 
 // ------------------------ COMPANION CONFIG ------------------
@@ -71,6 +71,7 @@ char companion_port[6]  = "16622";
 // WiFiManager custom params
 WiFiManagerParameter* custom_companionIP;
 WiFiManagerParameter* custom_companionPort;
+WiFiManagerParameter* param_bootCount;   // info/debug param
 
 // Device ID and hostname
 String deviceID;
@@ -93,12 +94,14 @@ unsigned long lastConnectTry   = 0;
 const unsigned long connectRetryMs  = 5000;
 const unsigned long pingIntervalMs  = 2000;
 
-// How many failed boots before forcing config portal
-// Only need one as it holds the CONFIG? scrolling text for that part.
+// How many previous boots before forcing config portal
 const uint8_t BOOT_FAIL_LIMIT = 1;
 
+// Cached copy of PRE-INCREMENT boot counter (from EEPROM)
+uint8_t bootCountCached = 0;
+
 // Brightness (0–100 from Companion)
-int brightness = 30;
+int brightness = 10;
 
 // ------------------------ TEXT STATE ------------------------
 
@@ -215,12 +218,20 @@ String getParam(const String& name) {
 void saveParamCallback() {
   String str_companionIP   = getParam("companionIP");
   String str_companionPort = getParam("companionPort");
+  String str_bootCount     = getParam("bootCount");
 
   if (str_companionIP.length() > 0) {
     str_companionIP.toCharArray(companion_host, sizeof(companion_host));
   }
   if (str_companionPort.length() > 0) {
     str_companionPort.toCharArray(companion_port, sizeof(companion_port));
+  }
+
+  // Optional: allow user to override boot counter from portal
+  if (str_bootCount.length() > 0) {
+    uint8_t newBC = (uint8_t)str_bootCount.toInt();
+    eepromWriteBootCounter(newBC);
+    Serial.printf("[WiFi] Boot counter updated from portal: %u\n", newBC);
   }
 
   eepromSaveCompanionConfig(companion_host, companion_port);
@@ -430,11 +441,18 @@ void parseAPI(const String& apiData) {
 }
 
 // ------------------------------------------------------------
-// CONFIG PORTAL (explicit trigger from boot counter)
+// CONFIG PORTAL (explicit trigger)
 // ------------------------------------------------------------
+void showConfigModeMessage() {
+  // Long helpful message – will scroll
+  String msg = "Config Mode: Connect to '" + deviceID +
+               "' then go to 192.168.4.1";
+  showBootMessage(msg);
+}
+
 void startConfigPortal() {
-  Serial.println("[WiFi] Entering CONFIG PORTAL mode due to boot counter");
-  showBootMessage("CONFIG\n192.168.4.1");
+  Serial.println("[WiFi] Entering CONFIG PORTAL mode (boot counter)");
+  showConfigModeMessage();
 
   // No timeout when we explicitly call config mode
   wifiManager.setConfigPortalTimeout(0);
@@ -460,25 +478,32 @@ void startConfigPortal() {
 }
 
 // ------------------------------------------------------------
-// WiFi / Initial Config + Boot Counter logic
+// WiFi / Initial Config logic
 // ------------------------------------------------------------
 
 void connectToNetwork() {
   WiFi.mode(WIFI_STA);
 
-  // Load Companion config from EEPROM
+  // Load Companion config from EEPROM (for default field values)
   eepromLoadCompanionConfig();
 
-  // Read boot counter (already incremented in setup())
-  uint8_t bootCount = eepromReadBootCounter();
-  Serial.printf("[Boot] Boot counter = %u\n", bootCount);
+  Serial.printf("[Boot] Cached boot counter (prev boot) = %u\n", bootCountCached);
 
-  // Prepare WiFiManager with params
+  // ---------- Prepare WiFiManager with params BEFORE any portal ----------
+
+  // Companion IP / Port params
   custom_companionIP   = new WiFiManagerParameter("companionIP", "Companion IP", companion_host, 40);
   custom_companionPort = new WiFiManagerParameter("companionPort", "Satellite Port", companion_port, 6);
 
+  // Boot counter info param
+  char bcStr[6];
+  snprintf(bcStr, sizeof(bcStr), "%u", bootCountCached);
+  param_bootCount = new WiFiManagerParameter("bootCount", "Boot Counter (info)", bcStr, 5);
+
   wifiManager.addParameter(custom_companionIP);
   wifiManager.addParameter(custom_companionPort);
+  wifiManager.addParameter(param_bootCount);
+
   wifiManager.setSaveParamsCallback(saveParamCallback);
 
   std::vector<const char*> menu = { "wifi", "param", "info", "sep", "restart", "exit" };
@@ -488,12 +513,15 @@ void connectToNetwork() {
 
   wifiManager.setAPCallback([](WiFiManager* wm) {
     Serial.println("[WiFi] Config portal started");
-    showBootMessage("CONFIG\n192.168.4.1");
+    showConfigModeMessage();
   });
 
-  // If we see too many early resets, force config portal
-  if (bootCount >= BOOT_FAIL_LIMIT) {
+  // -----------------------------------------------------------------------
+  // If previous boot requested config (via reset during CONFIG? window)
+  // -----------------------------------------------------------------------
+  if (bootCountCached >= BOOT_FAIL_LIMIT) {
     startConfigPortal();
+    // startConfigPortal() resets boot counter to 0 on success
   }
 
   // Normal autoConnect behaviour (connect to WiFi, or start portal if no WiFi)
@@ -561,26 +589,30 @@ void setup() {
   P.setZone(0, 0, MAX_DEVICES - 1);
   // Flip left/right to match your 4,3,2,1 wiring so it reads 1-2-3-4
   P.setZoneEffect(0, true, PA_FLIP_LR);
-  // If it ever looks upside-down, you can also try:
-  // P.setZoneEffect(0, true, PA_FLIP_UD);
 
   // --------------------------------------------------------
-  // NEW: Boot counter increment and BOOT → CONFIG? prompt
+  // Boot counter logic:
+  //  - bootCountCached = value from PREVIOUS run
+  //  - We immediately bump stored value so that if we reset
+  //    during CONFIG? window, next boot sees non-zero.
   // --------------------------------------------------------
-  uint8_t bootCount = eepromReadBootCounter();
-  if (bootCount < 255) {
-    bootCount++;
+  bootCountCached = eepromReadBootCounter();
+  uint8_t newCount = bootCountCached;
+  if (newCount < 255) {
+    newCount++;
   }
-  eepromWriteBootCounter(bootCount);
-  Serial.printf("[Boot] Boot counter (pre-wifi) = %u\n", bootCount);
+  eepromWriteBootCounter(newCount);
+  Serial.printf("[Boot] Boot counter previous=%u, new=%u\n", bootCountCached, newCount);
 
   // Show "BOOT" for 1 second
   showBootMessage("BOOT");
   delay(1000);
 
   // Show "CONFIG?" and sit there for 5 seconds.
-  // If the user hits reset during this, bootCount will climb and
-  // eventually trigger the config portal on the next boot.
+  // If you hit reset during this window:
+  //  - no WiFi connection
+  //  - boot counter does not get reset to 0
+  //  - next boot sees cached count >= 1 and forces config mode
   showBootMessage("CONFIG?");
   unsigned long cfgPromptStart = millis();
   while (millis() - cfgPromptStart < CONFIG_PROMPT_MS) {
@@ -592,7 +624,7 @@ void setup() {
     yield();  // keep the watchdog happy
   }
 
-  // WiFi + config (with boot counter logic)
+  // WiFi + config (with boot counter logic via bootCountCached)
   connectToNetwork();
 
   // After WiFi, show IP + Companion IP briefly
