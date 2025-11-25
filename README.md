@@ -19,18 +19,71 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 ## Hardware
 
 https://www.aliexpress.com/item/1005006038630745.html
-- **MCU**: ESP8266 (e.g. Wemos D1 mini, NodeMCU, or custom ESP8266MOD board)
-- **Display**: 32×8 LED matrix using **4× MAX7219** modules in a chain
-- **Wiring** (ESP8266 GPIO):
 
-| Signal | ESP8266 GPIO | Typical dev-board pin |
-|--------|--------------|------------------------|
-| CS     | 15           | D8                    |
-| CLK    | 14           | D5                    |
-| DIN    | 13           | D7                    |
 
-- The firmware is configured for:
+## Connecting to Wi-Fi / Companion
 
-```cpp
-#define HARDWARE_TYPE MD_MAX72XX::PAROLA_HW
-#define MAX_DEVICES   4
+The device boots and attempts Wi-Fi and Companion automatically.
+
+## Entering Config Portal
+
+The config portal starts if:
+
+1. Wi-Fi fails 5 boots in a row, OR
+2. You hold DOWNLOAD during power-on
+
+When active, the LED matrix shows:
+
+CONFIG
+192.168.4.1
+
+
+## Connect to the Wi-Fi network:
+
+SSID: LEDMatrix-<MAC>
+Password: (blank)
+
+
+Browse to:
+http://192.168.4.1
+
+
+Configure:
+- Wi-Fi SSID & password
+- Companion IP
+- Companion Satellite Port (default 16622)
+Settings save to EEPROM.
+
+##Companion Setup
+
+In Companion v4:
+- It should automatically show up as Satellite Surface
+- Assign the button offset in Surfaces
+
+## The device appears as:
+
+PRODUCT_NAME = "LED Matrix"
+KEYS_TOTAL   = 1
+TEXT         = true
+
+# You can now push text via:
+Buttons
+which means it can be driven by: Variables & Custom Actions!
+
+## Display Behaviour
+- Text ≤5 chars → centred static
+- Long text → smooth scroll from right to left
+- Updates do not flicker
+- BRIGHTNESS 0–100 maps to matrix intensity 0–15
+- “Waiting…” appears until Companion connects
+
+## Reset Modes
+### Normal reset
+- Tap RESET — device reconnects immediately.
+- Enter flash mode
+- Hold DOWNLOAD → tap RESET → release.
+
+###Enter config portal
+- Either:
+  - Hold DOWNLOAD during power-on, or
+  - Allow 5 failed Wi-Fi attempts in a row.
