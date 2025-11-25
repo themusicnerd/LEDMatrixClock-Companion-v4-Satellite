@@ -112,6 +112,9 @@ bool   textDirty    = false;
 // If you later add real big/small fonts, you can switch based on content
 bool   useBigFont   = true;
 
+// Invert flag based on background colour
+bool   invertDisplay = false;
+
 // ------------------------------------------------------------
 // Simple Base64 decoder (local, no extra libs)
 // ------------------------------------------------------------
@@ -281,6 +284,9 @@ void applyTextToParola() {
   // Use default internal font
   P.setFont(nullptr);
 
+  // Apply invert state (based on background colour)
+  P.setInvert(invertDisplay);
+
   // Copy into global matrixText buffer and NUL terminate
   size_t len = txt.length();
   if (len >= sizeof(matrixText)) {
@@ -332,12 +338,88 @@ void setText(const String& txt) {
 }
 
 // ------------------------------------------------------------
+// Colour parsing helpers for KEY-STATE
+// ------------------------------------------------------------
+
+// Helper: uppercase copy of a String
+String toUpperCaseStr(const String &s) {
+  String r = s;
+  for (size_t i = 0; i < r.length(); i++) {
+    r[i] = toupper(r[i]);
+  }
+  return r;
+}
+
+// Parse token forms like:
+//   COLOR="#RRGGBB"
+//   COLOR=#RRGGBB
+//   COLOR="R,G,B"
+//   COLOR=R,G,B
+bool parseColorToken(const String& line, const String& key, int &r, int &g, int &b) {
+  String upLine = toUpperCaseStr(line);
+  String upKey  = toUpperCaseStr(key);
+
+  int pos = upLine.indexOf(upKey);
+  if (pos < 0) return false;
+
+  pos += upKey.length();
+  if (pos < (int)upLine.length() && upLine[pos] == '=') pos++;
+
+  int end = upLine.indexOf(' ', pos);
+  if (end < 0) end = upLine.length();
+
+  String val = upLine.substring(pos, end);
+  val.trim();
+  if (val.length() == 0) return false;
+
+  // Strip surrounding quotes if present, e.g. "#FFFFFF" -> #FFFFFF
+  if (val.length() >= 2 && val[0] == '"' && val[val.length() - 1] == '"') {
+    val = val.substring(1, val.length() - 1);
+    val.trim();
+    if (val.length() == 0) return false;
+  }
+
+  // Hex form: #RRGGBB
+  if (val[0] == '#') {
+    if (val.length() < 7) return false;
+    String rs = val.substring(1, 3);
+    String gs = val.substring(3, 5);
+    String bs = val.substring(5, 7);
+    r = (int) strtol(rs.c_str(), nullptr, 16);
+    g = (int) strtol(gs.c_str(), nullptr, 16);
+    b = (int) strtol(bs.c_str(), nullptr, 16);
+    return true;
+  }
+
+  // Decimal CSV form: R,G,B
+  int c1 = val.indexOf(',');
+  int c2 = val.indexOf(',', c1 + 1);
+  if (c1 < 0 || c2 < 0) return false;
+
+  r = val.substring(0, c1).toInt();
+  g = val.substring(c1 + 1, c2).toInt();
+  b = val.substring(c2 + 1).toInt();
+  return true;
+}
+
+void handleKeyStateColor(const String& line) {
+  int r, g, b;
+  if (parseColorToken(line, "COLOR", r, g, b)) {
+    bool inv = (r >= 128) || (g >= 128) || (b >= 128);
+    invertDisplay = inv;
+    P.setInvert(invertDisplay);
+    Serial.printf("[API] COLOR r=%d g=%d b=%d -> invert=%s\n",
+                  r, g, b, invertDisplay ? "true" : "false");
+  }
+}
+
+// ------------------------------------------------------------
 // Companion / Satellite API parsing
 // ------------------------------------------------------------
 
 void sendAddDevice() {
   String cmd = "ADD-DEVICE DEVICEID=" + deviceID +
-               " PRODUCT_NAME=\"LED Matrix\" KEYS_TOTAL=1 KEYS_PER_ROW=1 BITMAPS=0 COLORS=0 TEXT=true";
+               " PRODUCT_NAME=\"LED Matrix\" KEYS_TOTAL=1 KEYS_PER_ROW=1 BITMAPS=0 COLORS=true TEXT=true";
   client.println(cmd);
   Serial.println("[API] Sent: " + cmd);
 }
@@ -435,7 +517,9 @@ void parseAPI(const String& apiData) {
   }
 
   if (apiData.startsWith("KEY-STATE")) {
-    handleKeyStateText(apiData);
+    Serial.println("[API] KEY-STATE raw line = " + apiData);
+    handleKeyStateColor(apiData);   // check COLOR=
+    handleKeyStateText(apiData);    // now handle text
     return;
   }
 }
@@ -444,10 +528,17 @@ void parseAPI(const String& apiData) {
 // CONFIG PORTAL (explicit trigger)
 // ------------------------------------------------------------
 void showConfigModeMessage() {
-  // Long helpful message – will scroll
-  String msg = "Config Mode: Connect to '" + deviceID +
-               "' then go to 192.168.4.1";
-  showBootMessage(msg);
+  // Short, static message that does not require animation.
+  // Important because WiFiManager blocks loop(), so scrolling text
+  // will not be animated while the portal is active.
+  P.displayClear();
+  P.setFont(nullptr);
+  P.setInvert(false);          // ensure normal polarity for config
+  invertDisplay = false;
+  P.setTextAlignment(PA_CENTER);
+  P.print("CFG 192.168.4.1");
+  textScrolls = false;
+  currentText = "CFG 192.168.4.1";
 }
 
 void startConfigPortal() {
@@ -698,7 +789,7 @@ void loop() {
   // Let Parola do its thing
   if (P.displayAnimate()) {
     // Only auto-reset for scrolling animations.
-    // For static text (PRINT), leave it alone so it doesn't flash.
+    // For static text (PRINT), leave it alone so it doesn’t flash.
     if (textScrolls) {
       P.displayReset();
     }
