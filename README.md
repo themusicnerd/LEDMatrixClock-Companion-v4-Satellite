@@ -52,7 +52,7 @@ Configure:
 - Companion Satellite Port (default 16622)
 Settings save to EEPROM.
 
-##Companion Setup
+## Companion Setup
 
 In Companion v4:
 - It should automatically show up as Satellite Surface
