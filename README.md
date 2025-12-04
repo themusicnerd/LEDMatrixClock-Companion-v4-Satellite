@@ -42,6 +42,24 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 
 https://www.aliexpress.com/item/1005006038630745.html
 
+## Arduino IDE Setup
+
+Before uploading the firmware, you need to install the ESP8266 board support in Arduino IDE:
+
+1. Start Arduino and open the Preferences window
+2. Enter `https://arduino.esp8266.com/stable/package_esp8266com_index.json` into the **File > Preferences > Additional Boards Manager URLs** field of the Arduino IDE. You can add multiple URLs, separating them with commas.
+3. Open **Boards Manager** from **Tools > Board** menu and install **esp8266** platform (and don't forget to select your ESP8266 board from **Tools > Board** menu after installation).
+
+## Required Libraries
+
+Install the following libraries via **Sketch > Include Library > Manage Libraries**:
+
+1. **WiFiManager** by tzapu
+2. **MD_Parola** by MajicDesigns
+3. **MD_MAX72XX** by MajicDesigns
+
+After installing these libraries, you should be able to compile and upload the firmware.
+
 ## Connecting to Wi-Fi / Companion
 
 The device boots and attempts Wi-Fi and Companion automatically.
