@@ -8,15 +8,18 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 
 - ✅ Supports **TEXT from Companion** (base64 decoded)
 - ✅ Centers short text, scrolls long text
-- ✅ COLOR parsing from Companion (COLOR="#RRGGBB" or R,G,B)
-- ✅ Auto-invert display when background color is bright
-- - If R ≥ 128 or G ≥ 128 or B ≥ 128 → invert = ON
-- - Keeps text readable regardless of Companion background color
+- ✅ COLOR parsing from Companion (`COLOR="#RRGGBB"` or `R,G,B`)
+- ✅ Background Modes (`bgmode`):
+  - `none`   – ignore COLOR, no invert, no bars
+  - `invert` – invert full display when any channel ≥ 128
+  - `bars`   – left & right 2-column bars ON when any channel ≥ 128
+  - `pgmpvw` – left bars = PGM (red ≥ 128), right bars = PVW (green ≥ 128)
+  - `pvwpgm` – left bars = PVW (green ≥ 128), right bars = PGM (red ≥ 128)
 - ✅ **Brightness** control via Companion BRIGHTNESS (0–100 → 0–15 LED intensity)
-- ✅ **WiFiManager** config portal (for WiFi + Companion IP/port)
-- ✅ Companion IP/port stored in **EEPROM**
+- ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
+- ✅ Companion IP/port + background mode stored in **EEPROM**
 - ✅ **Boot counter** to force config mode with repeated resets
-- ✅ Designed for cheap LED Matrix clocks based of ESP8266 on AliExpress
+- ✅ Designed for cheap LED matrix clocks based on ESP8266 from AliExpress
 
 ---
 # Display Behaviour
@@ -83,10 +86,16 @@ The device boots and attempts Wi-Fi and Companion automatically.
 
 ## Entering Config Portal
 
-On boot if you see CONFIG? and you reset while it is scrolling, you will enter WiFi Manager config mode.
+On boot if you see CONFIG? and you reset while it is scrolling, you will enter WiFi Manager config mode and display CFG! on the LED Matrix.
 - Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
 - It should take you to 192.168.4.1 (if not, go there)
-- Setup the Companion IP, Companion Port, and set Boot to 0
+- Setup the Companion IP, Companion Port, set the mode you want, and set Boot to 0
+- Modes Are:
+- - none    – ignore COLOR, no invert, no bars
+- - invert  – invert the whole display when any color channel ≥ 128
+- - bars    – left and right 2-column bars ON when any color channel ≥ 128
+- - pgmpvw  – left = PGM (red ≥ 128), right = PVW (green ≥ 128)
+- - pvwpgm  – left = PVW (green ≥ 128), right = PGM (red ≥ 128)
 - Save
 - Hit BACK in your browser to get to the main menu (may be more than once)
 - Setup Wifi
