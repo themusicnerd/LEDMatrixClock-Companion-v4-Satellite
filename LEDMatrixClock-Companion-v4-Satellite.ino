@@ -31,6 +31,12 @@
     - bars    : left+right 2 columns ON if any channel >=128
     - pgmpvw  : left 2 = red>=128 (PGM), right 2 = green>=128 (PVW)
     - pvwpgm  : left 2 = green>=128 (PVW), right 2 = red>=128 (PGM)
+  
+  Library Modification:
+    - ESP8266mDNS library modified to increase MDNS_SERVICE_NAME_LENGTH
+    - Changed from 15 to 25 characters in LEAmDNS.h line 161
+    - Required to support "companion-satellite" service name (17 chars)
+    - Without this modification, service registration fails due to length validation
   ------------------------------------------------------------
 */
 
@@ -41,6 +47,9 @@
 #include <MD_MAX72xx.h>
 #include <SPI.h>
 #include <vector>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ESP8266WebServer.h>
 
 // ------------------------ MATRIX CONFIG ---------------------
 
@@ -102,6 +111,9 @@ bool invertDisplay = false;
 WiFiManager wifiManager;
 WiFiClient  client;
 
+// REST API Server for Companion configuration
+ESP8266WebServer restServer(9999);
+
 // What we store in EEPROM
 char companion_host[40] = "Companion IP";
 char companion_port[6]  = "16622";
@@ -109,7 +121,6 @@ char companion_port[6]  = "16622";
 // WiFiManager custom params
 WiFiManagerParameter* custom_companionIP;
 WiFiManagerParameter* custom_companionPort;
-WiFiManagerParameter* param_bootCount;   // info/debug param
 WiFiManagerParameter* custom_bgMode;     // background handling mode
 
 // Device ID and hostname
@@ -124,6 +135,7 @@ const char* AP_password = "";
 // [3..42]  = companion_host (40 bytes)
 // [43..48] = companion_port (6 bytes)
 // [50..65] = bg_mode_str (16 bytes)
+// [66]     = brightness (0-100)
 // [60]     = bootCounter
 const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_BOOT_ADDR = 60;
@@ -131,11 +143,38 @@ const uint16_t EEPROM_BOOT_ADDR = 60;
 // Timing / connection
 unsigned long lastPingTime     = 0;
 unsigned long lastConnectTry   = 0;
-const unsigned long connectRetryMs  = 5000;
+const unsigned long connectRetryMs  = 15000;
 const unsigned long pingIntervalMs  = 2000;
+
+// Brightness write debouncing
+unsigned long lastBrightnessChange = 0;
+bool brightnessWritePending = false;
+const unsigned long brightnessWriteDelay = 5000; // 5 seconds
+
+// WiFi OK / MAC alternation
+unsigned long lastWiFiOKToggle = 0;
+bool showMACAddress = false;
+const unsigned long wifiOKToggleDelay = 5000; // 5 seconds
+String macShort = ""; // First 5 chars of MAC address
+bool firstConnectionAttemptMade = false; // Track if first connection attempt was made
+
+// Delayed Connecting... message
+unsigned long connectionStartTime = 0;
+bool connectingMessageShown = false;
+const unsigned long connectingMessageDelay = 1000; // 1 second
+bool connectionEstablished = false; // Track when connection is fully established
 
 // How many previous boots before forcing config portal
 const uint8_t BOOT_FAIL_LIMIT = 1;
+
+// Config state tracking
+enum ConfigState {
+  CFG_NORMAL = 0,
+  CFG_REQUESTED = 1,
+  CFG_ACTIVE = 2
+};
+
+ConfigState configState = CFG_NORMAL;
 
 // Cached copy of PRE-INCREMENT boot counter (from EEPROM)
 uint8_t bootCountCached = 0;
@@ -204,17 +243,24 @@ void eepromLoadCompanionConfig() {
     }
     companion_port[5] = '\0';
 
-    // background mode string (16 bytes)
+    // bg_mode_str
     for (int i = 0; i < 16; i++) {
       bg_mode_str[i] = (char)EEPROM.read(50 + i);
     }
     bg_mode_str[15] = '\0';
 
-    // If uninitialised (0xFF or empty), default to "invert"
-    if (bg_mode_str[0] == (char)0xFF || bg_mode_str[0] == '\0') {
-      strncpy(bg_mode_str, "invert", sizeof(bg_mode_str));
-      bg_mode_str[sizeof(bg_mode_str) - 1] = '\0';
+    // brightness
+    brightness = EEPROM.read(66);
+    // Validate brightness range
+    if (brightness < 0 || brightness > 100) {
+      brightness = 1; // default if invalid
     }
+  } else {
+    // No valid data - set defaults
+    strcpy(companion_host, "192.168.1.100");
+    strcpy(companion_port, "9999");
+    strcpy(bg_mode_str, "invert");
+    brightness = 1; // default brightness
   }
   EEPROM.end();
 }
@@ -238,11 +284,14 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
     EEPROM.write(43 + i, (uint8_t)c);
   }
 
-  // background mode string
+  // bg_mode_str (skip address 49 for alignment)
   for (int i = 0; i < 16; i++) {
     char c = (i < (int)strlen(bg_mode_str)) ? bg_mode_str[i] : 0;
     EEPROM.write(50 + i, (uint8_t)c);
   }
+
+  // brightness
+  EEPROM.write(66, (uint8_t)brightness);
 
   EEPROM.commit();
   EEPROM.end();
@@ -252,14 +301,16 @@ uint8_t eepromReadBootCounter() {
   EEPROM.begin(EEPROM_SIZE);
   uint8_t c = EEPROM.read(EEPROM_BOOT_ADDR);
   EEPROM.end();
+  Serial.printf("[EEPROM] Read boot counter: %u\n", c);
   return c;
 }
 
 void eepromWriteBootCounter(uint8_t c) {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.write(EEPROM_BOOT_ADDR, c);
-  EEPROM.commit();
+  bool commitResult = EEPROM.commit();
   EEPROM.end();
+  Serial.printf("[EEPROM] Write boot counter: %u, commit result: %s\n", c, commitResult ? "SUCCESS" : "FAILED");
 }
 
 // ------------------------------------------------------------
@@ -413,18 +464,15 @@ void saveParamCallback() {
     bg_mode_str[sizeof(bg_mode_str) - 1] = '\0';
   }
 
-  // Optional: allow user to override boot counter from portal
-  if (str_bootCount.length() > 0) {
-    uint8_t newBC = (uint8_t)str_bootCount.toInt();
-    eepromWriteBootCounter(newBC);
-    Serial.printf("[WiFi] Boot counter updated from portal: %u\n", newBC);
-  }
-
   // Update bgMode from updated string
   bgMode = parseBgMode(bg_mode_str);
   applyBackgroundFromLastColor();
 
   eepromSaveCompanionConfig(companion_host, companion_port);
+  
+  // Reset boot counter to 0 to ensure we exit config mode if WiFiManager reboots
+  eepromWriteBootCounter(0);
+  Serial.println("[WiFi] Settings saved - boot counter reset to 0 for normal boot");
 }
 
 // ------------------------------------------------------------
@@ -491,6 +539,21 @@ void applyTextToParola() {
 
   // Also treat “short” text as fitting even if estimate is wrong
   textFits = textFits || (len <= 5);
+  
+  // Specific override: WiFi ! should always be static
+  if (txt == "WiFi !") {
+    textFits = true;
+  }
+  
+  // Specific override: WiFi ? should always be static
+  if (txt == "WiFi ?") {
+    textFits = true;
+  }
+  
+  // Specific override: Hello! should always be static
+  if (txt == "Hello!") {
+    textFits = true;
+  }
 
   P.displayClear();
 
@@ -513,8 +576,8 @@ void applyTextToParola() {
     P.displayReset();
   }
 
-  // Reapply bars on top of whatever we just drew (modes that use bars)
-  if (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM) {
+  // Reapply bars on top of whatever we just drew (modes that use bars) - only when Companion is connected
+  if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
     updateBackgroundBars(barLeftOn, barRightOn);
   }
 }
@@ -602,7 +665,8 @@ void handleKeyStateColor(const String& line) {
 // ------------------------------------------------------------
 
 void sendAddDevice() {
-  String cmd = "ADD-DEVICE DEVICEID=" + deviceID +
+  String companionDeviceID = "led-matrix:" + macShort;
+  String cmd = "ADD-DEVICE DEVICEID=" + companionDeviceID +
                " PRODUCT_NAME=\"LED Matrix\" KEYS_TOTAL=1 KEYS_PER_ROW=1 BITMAPS=0 COLORS=true TEXT=true";
   client.println(cmd);
   Serial.println("[API] Sent: " + cmd);
@@ -690,6 +754,11 @@ void parseAPI(const String& apiData) {
       brightness = v.toInt();
       Serial.println("[API] BRIGHTNESS set to " + String(brightness));
       setMatrixBrightnessFromPercent(brightness);
+      
+      // Mark brightness for delayed EEPROM write (debounce)
+      lastBrightnessChange = millis();
+      brightnessWritePending = true;
+      Serial.println("[EEPROM] Brightness change marked for delayed write");
     }
     return;
   }
@@ -720,23 +789,60 @@ void showConfigModeMessage() {
   P.setInvert(false);          // ensure normal polarity for config
   invertDisplay = false;
   P.setTextAlignment(PA_CENTER);
-  P.print("CFG!");
+  P.print("CFG !");
   textScrolls = false;
-  currentText = "CFG!";
+  currentText = "CFG !";
 
   // Clear bars in config mode (just show text)
   updateBackgroundBars(false, false);
 }
 
 void startConfigPortal() {
-  Serial.println("[WiFi] Entering CONFIG PORTAL mode (boot counter)");
+  Serial.println("[WiFi] Entering CONFIG PORTAL mode");
+  configState = CFG_ACTIVE;
+  
+  // Load Companion config from EEPROM (for default field values)
+  eepromLoadCompanionConfig();
+
+  // Parse bgMode from loaded bg_mode_str
+  bgMode = parseBgMode(bg_mode_str);
+  applyBackgroundFromLastColor();
+
+  // ---------- Prepare WiFiManager with params ----------
+  // Companion IP / Port params
+  custom_companionIP   = new WiFiManagerParameter("companionIP", "Companion IP", companion_host, 40);
+  custom_companionPort = new WiFiManagerParameter("companionPort", "Satellite Port", companion_port, 6);
+
+  // Background mode param
+  custom_bgMode = new WiFiManagerParameter(
+    "bgmode",
+    "Background Handling (none/invert/bars/pgmpvw/pvwpgm)",
+    bg_mode_str,
+    16
+  );
+
+  wifiManager.addParameter(custom_companionIP);
+  wifiManager.addParameter(custom_companionPort);
+  wifiManager.addParameter(custom_bgMode);
+
+  wifiManager.setSaveParamsCallback(saveParamCallback);
+
+  std::vector<const char*> menu = { "wifi", "param", "info", "sep", "restart", "exit" };
+  wifiManager.setMenu(menu);
+  wifiManager.setClass("invert");  // Dark mode
+  wifiManager.setConfigPortalTimeout(0); // No timeout when we explicitly call config mode
+
+  wifiManager.setAPCallback([](WiFiManager* wm) {
+    Serial.println("[WiFi] Config portal started");
+    showConfigModeMessage();
+  });
+  
   showConfigModeMessage();
 
-  // No timeout when we explicitly call config mode
-  wifiManager.setConfigPortalTimeout(0);
-
   // Start AP + portal, blocks until user saves or exits
-  wifiManager.startConfigPortal(deviceID.c_str(), AP_password);
+  String shortDeviceID = "led-matrix_" + macShort;  // Use underscore format for SSID and display
+  wifiManager.startConfigPortal(shortDeviceID.c_str(), AP_password);
+  Serial.printf("[WiFi] Config portal started - SSID: %s\n", shortDeviceID.c_str());
 
   // After returning, update our Companion host/port/bgMode and persist
   strncpy(companion_host, custom_companionIP->getValue(), sizeof(companion_host));
@@ -754,6 +860,7 @@ void startConfigPortal() {
 
   // Reset boot counter so we do not immediately re-enter config
   eepromWriteBootCounter(0);
+  configState = CFG_NORMAL;
 
   // Show a small message so you know it applied
   showBootMessage("CFG SAVED");
@@ -782,11 +889,6 @@ void connectToNetwork() {
   custom_companionIP   = new WiFiManagerParameter("companionIP", "Companion IP", companion_host, 40);
   custom_companionPort = new WiFiManagerParameter("companionPort", "Satellite Port", companion_port, 6);
 
-  // Boot counter info param
-  char bcStr[6];
-  snprintf(bcStr, sizeof(bcStr), "%u", bootCountCached);
-  param_bootCount = new WiFiManagerParameter("bootCount", "Boot Counter (set to 0 to boot normally)", bcStr, 5);
-
   // Background mode param
   custom_bgMode = new WiFiManagerParameter(
     "bgmode",
@@ -797,7 +899,6 @@ void connectToNetwork() {
 
   wifiManager.addParameter(custom_companionIP);
   wifiManager.addParameter(custom_companionPort);
-  wifiManager.addParameter(param_bootCount);
   wifiManager.addParameter(custom_bgMode);
 
   wifiManager.setSaveParamsCallback(saveParamCallback);
@@ -813,26 +914,28 @@ void connectToNetwork() {
   });
 
   // -----------------------------------------------------------------------
-  // If previous boot requested config (via reset during CONFIG? window)
+  // Boot counter logic is now handled in setup() - no checks needed here
   // -----------------------------------------------------------------------
-  if (bootCountCached >= BOOT_FAIL_LIMIT) {
-    startConfigPortal();
-    // startConfigPortal() resets boot counter to 0 on success
-  }
 
   // Normal autoConnect behaviour (connect to WiFi, or start portal if no WiFi)
-  bool res = wifiManager.autoConnect(deviceID.c_str(), AP_password);
+  // Show "WiFi" during connection attempt
+  showBootMessage("WiFi ?");
+  
+  // Use shortened device ID for WiFi portal name (underscore format)
+  String shortDeviceID = "led-matrix_" + macShort;  // Use underscore format for SSID and display
+  bool res = wifiManager.autoConnect(shortDeviceID.c_str(), AP_password);
+  Serial.printf("[WiFi] AutoConnect - SSID: %s\n", shortDeviceID.c_str());
 
   if (!res) {
-    Serial.println("[WiFi] Failed to connect, restarting...");
-    showBootMessage("WiFi ERR");
-    delay(1000);
-    ESP.restart();
+    Serial.println("[WiFi] Failed to connect, starting config portal...");
+    showBootMessage("CFG !");
+    // WiFiManager will automatically start config portal on failure
+    // No need to restart - let WiFiManager handle it
   } else {
     Serial.print("[WiFi] Connected: ");
     Serial.println(WiFi.localIP());
-    showBootMessage("WiFi OK");
-    delay(1000);
+    // Display WiFi OK immediately after connection succeeds
+    showBootMessage("WiFi !");
   }
 
   // Copy latest values (including bgMode)
@@ -845,13 +948,264 @@ void connectToNetwork() {
   strncpy(bg_mode_str, custom_bgMode->getValue(), sizeof(bg_mode_str));
   bg_mode_str[sizeof(bg_mode_str) - 1] = '\0';
   bgMode = parseBgMode(bg_mode_str);
-  applyBackgroundFromLastColor();
+  // Don't apply background yet - no color data and it clears WiFi ! message
 
   eepromSaveCompanionConfig(companion_host, companion_port);
 
   // WiFi successfully connected => clear boot counter
   eepromWriteBootCounter(0);
-  Serial.println("[Boot] Boot counter reset to 0 (WiFi OK)");
+  Serial.println("[Boot] Boot counter reset to 0 (WiFi !)");
+}
+
+// ------------------------------------------------------------
+// REST API Handlers for Companion Configuration
+// ------------------------------------------------------------
+void handleGetHost() {
+  restServer.send(200, "text/plain", companion_host);
+  Serial.println("[REST] GET /api/host: " + String(companion_host));
+}
+
+void handleGetPort() {
+  restServer.send(200, "text/plain", companion_port);
+  Serial.println("[REST] GET /api/port: " + String(companion_port));
+}
+
+void handleGetConfig() {
+  String json = "{\"host\":\"" + String(companion_host) + "\",\"port\":" + String(companion_port) + "}";
+  restServer.send(200, "application/json", json);
+  Serial.println("[REST] GET /api/config: " + json);
+}
+
+void handlePostHost() {
+  String newHost = "";
+  
+  // Try to parse JSON first
+  if (restServer.hasArg("plain")) {
+    String body = restServer.arg("plain");
+    body.trim();
+    
+    // Check if it's JSON format
+    if (body.startsWith("{") && body.endsWith("}")) {
+      int hostPos = body.indexOf("\"host\":");
+      if (hostPos >= 0) {
+        int startQuote = body.indexOf("\"", hostPos + 7);
+        int endQuote = body.indexOf("\"", startQuote + 1);
+        if (startQuote >= 0 && endQuote > startQuote) {
+          newHost = body.substring(startQuote + 1, endQuote);
+        }
+      }
+    } else {
+      // Plain text format
+      newHost = body;
+    }
+  }
+  
+  newHost.trim();
+  
+  if (newHost.length() > 0 && newHost.length() < sizeof(companion_host)) {
+    strncpy(companion_host, newHost.c_str(), sizeof(companion_host));
+    companion_host[sizeof(companion_host) - 1] = '\0';
+    
+    // Save to EEPROM
+    eepromSaveCompanionConfig(companion_host, companion_port);
+    
+    // Update WiFiManager parameter
+    if (custom_companionIP) {
+      custom_companionIP->setValue(companion_host, sizeof(companion_host));
+    }
+    
+    restServer.send(200, "text/plain", "OK");
+    Serial.println("[REST] POST /api/host: Updated to " + String(companion_host));
+    
+    // Reestablish connection
+    if (client.connected()) {
+      client.stop();
+      Serial.println("[REST] Disconnected from Companion to reconnect with new host");
+    }
+    lastConnectTry = 0; // Force immediate reconnection attempt
+    
+  } else {
+    restServer.send(400, "text/plain", "Invalid host");
+    Serial.println("[REST] POST /api/host: Invalid host provided");
+  }
+}
+
+void handlePostPort() {
+  String newPort = "";
+  
+  // Try to parse JSON first
+  if (restServer.hasArg("plain")) {
+    String body = restServer.arg("plain");
+    body.trim();
+    
+    // Check if it's JSON format
+    if (body.startsWith("{") && body.endsWith("}")) {
+      int portPos = body.indexOf("\"port\":");
+      if (portPos >= 0) {
+        int colon = body.indexOf(":", portPos + 7);
+        if (colon >= 0) {
+          int endBrace = body.indexOf("}", colon);
+          if (endBrace > colon) {
+            newPort = body.substring(colon + 1, endBrace);
+          } else {
+            // If no closing brace found, take everything after colon
+            newPort = body.substring(colon + 1);
+          }
+          newPort.trim();
+        }
+      }
+    } else {
+      // Plain text format
+      newPort = body;
+    }
+  }
+  
+  newPort.trim();
+  
+  if (newPort.length() > 0 && newPort.length() < sizeof(companion_port)) {
+    int portNum = newPort.toInt();
+    if (portNum > 0 && portNum <= 65535) {
+      strncpy(companion_port, newPort.c_str(), sizeof(companion_port));
+      companion_port[sizeof(companion_port) - 1] = '\0';
+      
+      // Save to EEPROM
+      eepromSaveCompanionConfig(companion_host, companion_port);
+      
+      // Update WiFiManager parameter
+      if (custom_companionPort) {
+        custom_companionPort->setValue(companion_port, sizeof(companion_port));
+      }
+      
+      restServer.send(200, "text/plain", "OK");
+      Serial.println("[REST] POST /api/port: Updated to " + String(companion_port));
+      
+      // Reestablish connection
+      if (client.connected()) {
+        client.stop();
+        Serial.println("[REST] Disconnected from Companion to reconnect with new port");
+      }
+      lastConnectTry = 0; // Force immediate reconnection attempt
+      
+    } else {
+      restServer.send(400, "text/plain", "Invalid port number");
+      Serial.println("[REST] POST /api/port: Invalid port number: " + newPort);
+    }
+  } else {
+    restServer.send(400, "text/plain", "Invalid port");
+    Serial.println("[REST] POST /api/port: Invalid port provided");
+  }
+}
+
+void handlePostConfig() {
+  String newHost = "";
+  String newPort = "";
+  
+  if (restServer.hasArg("plain")) {
+    String body = restServer.arg("plain");
+    body.trim();
+    
+    // Parse JSON
+    if (body.startsWith("{") && body.endsWith("}")) {
+      // Parse host
+      int hostPos = body.indexOf("\"host\":");
+      if (hostPos >= 0) {
+        int startQuote = body.indexOf("\"", hostPos + 7);
+        int endQuote = body.indexOf("\"", startQuote + 1);
+        if (startQuote >= 0 && endQuote > startQuote) {
+          newHost = body.substring(startQuote + 1, endQuote);
+          newHost.trim();
+        }
+      }
+      
+      // Parse port
+      int portPos = body.indexOf("\"port\":");
+      if (portPos >= 0) {
+        int colon = body.indexOf(":", portPos + 6);
+        if (colon >= 0) {
+          // Skip the colon and any whitespace
+          int start = colon + 1;
+          while (start < body.length() && (body[start] == ' ' || body[start] == '\t')) {
+            start++;
+          }
+          
+          // Look for either } or end of string
+          int endBrace = body.indexOf("}", start);
+          if (endBrace > start) {
+            newPort = body.substring(start, endBrace);
+          } else {
+            // If no closing brace found, take everything after colon
+            newPort = body.substring(start);
+          }
+          newPort.trim();
+        }
+      }
+    }
+  }
+  
+  // Debug output
+  Serial.println("[REST] DEBUG: Parsed newHost='" + newHost + "' newPort='" + newPort + "'");
+  
+  bool hostValid = (newHost.length() > 0 && newHost.length() < sizeof(companion_host));
+  bool portValid = false;
+  int portNum = newPort.toInt();
+  portValid = (newPort.length() > 0 && portNum > 0 && portNum <= 65535);
+  
+  Serial.println("[REST] DEBUG: hostValid=" + String(hostValid) + " portValid=" + String(portValid) + " portNum=" + String(portNum));
+  
+  if (hostValid && portValid) {
+    strncpy(companion_host, newHost.c_str(), sizeof(companion_host));
+    companion_host[sizeof(companion_host) - 1] = '\0';
+    
+    strncpy(companion_port, newPort.c_str(), sizeof(companion_port));
+    companion_port[sizeof(companion_port) - 1] = '\0';
+    
+    // Save to EEPROM
+    eepromSaveCompanionConfig(companion_host, companion_port);
+    
+    // Update WiFiManager parameters
+    if (custom_companionIP) {
+      custom_companionIP->setValue(companion_host, sizeof(companion_host));
+    }
+    if (custom_companionPort) {
+      custom_companionPort->setValue(companion_port, sizeof(companion_port));
+    }
+    
+    restServer.send(200, "text/plain", "OK");
+    Serial.println("[REST] POST /api/config: Updated host=" + String(companion_host) + " port=" + String(companion_port));
+    
+    // Reestablish connection
+    if (client.connected()) {
+      client.stop();
+      Serial.println("[REST] Disconnected from Companion to reconnect with new config");
+    }
+    lastConnectTry = 0; // Force immediate reconnection attempt
+    
+  } else {
+    restServer.send(400, "text/plain", "Invalid config");
+    Serial.println("[REST] POST /api/config: Invalid config provided - hostValid=" + String(hostValid) + " portValid=" + String(portValid));
+  }
+}
+
+void setupRestAPI() {
+  // Register endpoints
+  restServer.on("/api/host", HTTP_GET, handleGetHost);
+  restServer.on("/api/port", HTTP_GET, handleGetPort);
+  restServer.on("/api/config", HTTP_GET, handleGetConfig);
+  
+  restServer.on("/api/host", HTTP_POST, handlePostHost);
+  restServer.on("/api/port", HTTP_POST, handlePostPort);
+  restServer.on("/api/config", HTTP_POST, handlePostConfig);
+  
+  // Start server
+  restServer.begin();
+  Serial.println("[REST] REST API server started on port 9999");
+  Serial.println("[REST] Endpoints:");
+  Serial.println("[REST]   GET  /api/host - Get current companion host");
+  Serial.println("[REST]   GET  /api/port - Get current companion port");
+  Serial.println("[REST]   GET  /api/config - Get companion config as JSON");
+  Serial.println("[REST]   POST /api/host - Set companion host");
+  Serial.println("[REST]   POST /api/port - Set companion port");
+  Serial.println("[REST]   POST /api/config - Set companion host and port");
 }
 
 // ------------------------------------------------------------
@@ -878,13 +1232,26 @@ void setup() {
   deviceID += macBuf;
   deviceID.toUpperCase();
 
+  // Create short MAC string (last 5 characters) directly from MAC buffer
+  macShort = String(macBuf).substring(7); // Take last 5 chars directly from MAC
+  Serial.println("[MAC] Short MAC for display: " + macShort);
+
   Serial.println("[ID] deviceID = " + deviceID);
-  WiFi.hostname(deviceID);
+  // Set WiFi hostname using underscore format
+  String wifiHostname = "led-matrix_" + macShort;
+  WiFi.hostname(wifiHostname);
+  Serial.printf("[WiFi] Hostname set to: %s\n", wifiHostname.c_str());
+
+  // Load configuration from EEPROM before setting up display
+  eepromLoadCompanionConfig();
 
   // Matrix init
   P.begin();
   P.setIntensity(8);
   P.displayClear();
+
+  // Set initial brightness immediately after matrix init (now with loaded value)
+  setMatrixBrightnessFromPercent(brightness);
 
   // Grab underlying MAX72XX object
   mx = P.getGraphicObject();
@@ -898,27 +1265,33 @@ void setup() {
   updateBackgroundBars(false, false);
 
   // --------------------------------------------------------
-  // Boot counter logic:
-  //  - bootCountCached = value from PREVIOUS run
-  //  - We immediately bump stored value so that if we reset
-  //    during CONFIG? window, next boot sees non-zero.
+  // Simplified boot counter logic:
+  //  - 0 → Hello! → write 1
+  //  - 1 → CFG ! → write 0
+  //  - Hello! timeout → write 0
   // --------------------------------------------------------
   bootCountCached = eepromReadBootCounter();
-  uint8_t newCount = bootCountCached;
-  if (newCount < 255) {
-    newCount++;
+  Serial.printf("[Boot] Boot counter read: %u\n", bootCountCached);
+  
+  if (bootCountCached == 1) {
+    // Boot counter 1 → trigger config portal
+    Serial.println("[Boot] Boot counter 1 → triggering config portal");
+    eepromWriteBootCounter(0);  // Reset immediately
+    bootCountCached = 0;
+    startConfigPortal();
+    // startConfigPortal() will handle CFG ! display
+    return;  // Skip Hello! logic
+  } else {
+    // Boot counter 0 (or any other value) → normal boot with Hello!
+    Serial.println("[Boot] Boot counter 0 → normal boot with Hello!");
+    eepromWriteBootCounter(1);  // Set to 1 for next boot trigger
   }
-  eepromWriteBootCounter(newCount);
-  Serial.printf("[Boot] Boot counter previous=%u, new=%u\n", bootCountCached, newCount);
 
-  // Show "BOOT" for 1 second
-  showBootMessage("BOOT");
-  delay(1000);
-
-  // Show "CONFIG?" and sit there for CONFIG_PROMPT_MS.
-  showBootMessage("CONFIG?");
-  unsigned long cfgPromptStart = millis();
-  while (millis() - cfgPromptStart < CONFIG_PROMPT_MS) {
+  // Show "Hello!" for 3 seconds
+  showBootMessage("Hello!");
+  
+  unsigned long helloStart = millis();
+  while (millis() - helloStart < 3000) {
     if (P.displayAnimate()) {
       if (textScrolls) {
         P.displayReset();
@@ -926,21 +1299,73 @@ void setup() {
     }
     yield();  // keep the watchdog happy
   }
+  
+  // Clear screen after Hello! message completes
+  P.displayClear();
+  currentText = "";
+  
+  // Hello! timeout → reset boot counter to 0
+  eepromWriteBootCounter(0);
+  bootCountCached = 0;
+  Serial.println("[Boot] Hello! timeout - boot counter reset to 0");
 
   // WiFi + config (with boot counter logic via bootCountCached)
   connectToNetwork();
 
-  // After WiFi, show IP + Companion IP briefly
-  String ipMsg = "IP " + WiFi.localIP().toString();
-  showBootMessage(ipMsg);
-  delay(2000);   // a bit more time so you can read it
+  // Initialize mDNS service after WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[mDNS] Starting mDNS service...");
+    
+    // Wait a bit for WiFi to fully stabilize
+    delay(1000);
+    
+    // Start mDNS with underscore hostname format
+    String mDNSHostname = "led-matrix_" + macShort;
+    if (!MDNS.begin(mDNSHostname.c_str())) {
+      Serial.println("[mDNS] Error setting up mDNS responder!");
+    } else {
+      Serial.println("[mDNS] mDNS responder started");
+      Serial.printf("[mDNS] Hostname: %s.local\n", mDNSHostname.c_str());
+      Serial.printf("[mDNS] IP Address: %s\n", WiFi.localIP().toString().c_str());
+      
+      // Set instance name using shortened MAC (last 5 chars) with colon format
+      String mDNSInstanceName = "led-matrix:" + macShort;
+      MDNS.setInstanceName(mDNSInstanceName);
+      Serial.printf("[mDNS] Instance name set to: %s\n", mDNSInstanceName.c_str());
+      
+      // Add service with companion-satellite name (17 chars - supported after library modification)
+      // Library MDNS_SERVICE_NAME_LENGTH increased from 15 to 25 to allow hyphenated service names
+      bool serviceAdded = MDNS.addService("companion-satellite", "tcp", 9999);
+      
+      if (serviceAdded) {
+        Serial.println("[mDNS] SUCCESS: companion-satellite service registered!");
+        Serial.println("[mDNS] Library modification successful - hyphenated service names now supported");
+        
+        // Add TXT record
+        MDNS.addServiceTxt("companion-satellite", "tcp", "restEnabled", "true");
+        Serial.println("[mDNS] Added restEnabled=true to companion-satellite service");
+        
+        // Force mDNS updates
+        for (int i = 0; i < 3; i++) {
+          MDNS.update();
+          delay(1000);
+          Serial.printf("[mDNS] Update %d/3 completed\n", i+1);
+        }
+        
+        Serial.println("[mDNS] Setup complete - service discoverable");
+        Serial.println("[mDNS] Test with: dns-sd -B companion-satellite._tcp");
+        Serial.println("[mDNS] SUCCESS: Full companion-satellite service name working!");
+        
+      } else {
+        Serial.println("[mDNS] ERROR: companion-satellite service registration failed!");
+        Serial.println("[mDNS] Library modification may not be sufficient - need further investigation");
+        return;
+      }
+    }
+  }
 
-  String compMsg = "COMP " + String(companion_host);
-  showBootMessage(compMsg);
-  delay(2000);
-
-  // Set initial brightness
-  setMatrixBrightnessFromPercent(brightness);
+  // Start REST API server
+  setupRestAPI();
 
   Serial.println("[System] Setup complete, entering loop");
 }
@@ -952,27 +1377,52 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // Handle mDNS updates (non-blocking)
+  MDNS.update();
+
+  // Handle REST API requests
+  restServer.handleClient();
+
   // Attempt Companion connection if not connected
   if (!client.connected() && (now - lastConnectTry >= connectRetryMs)) {
     lastConnectTry = now;
+    
+    // Mark that first connection attempt has been made
+    firstConnectionAttemptMade = true;
 
     Serial.print("[NET] Connecting to Companion ");
     Serial.print(companion_host);
     Serial.print(":");
     Serial.println(companion_port);
 
+    // Set connection timeout to ensure non-blocking behavior
+    client.setTimeout(1000);  // 1 second timeout
+    
     if (client.connect(companion_host, atoi(companion_port))) {
       Serial.println("[NET] Connected to Companion API");
-      showBootMessage("Connected");
-      delay(500);
+      // WiFi ! remains displayed untilsetText("Connecting...") overwrites it
       sendAddDevice();
       lastPingTime = millis();
-      // Show waiting text until Companion sends first TEXT
-      setText("Waiting...");
+      // Start timer for delayed Connecting... message (only if TCP connection succeeded)
+      connectionStartTime = now;
+      connectingMessageShown = false;
+      connectionEstablished = false; // Reset for new connection
     } else {
       Serial.println("[NET] Companion connect failed");
+      // Reset connection timer on failure - don't show Connecting... message
+      connectionStartTime = 0;
+      connectingMessageShown = false;
+      connectionEstablished = false;
       // NO config portal here – just keep retrying
     }
+  }
+
+  // Handle delayed Connecting... message display (only if TCP connection succeeded and not established)
+  if (client.connected() && !connectionEstablished && !connectingMessageShown && connectionStartTime > 0 && 
+      (now - connectionStartTime >= connectingMessageDelay)) {
+    setText("Connecting...");
+    connectingMessageShown = true;
+    Serial.println("[Display] Showing Connecting... after 1s delay");
   }
 
   // Handle Companion traffic
@@ -981,6 +1431,14 @@ void loop() {
       String line = client.readStringUntil('\n');
       line.trim();
       if (line.length() > 0) {
+        // Mark connection as established and stop showing Connecting...
+        if (!connectionEstablished) {
+          connectionEstablished = true;
+          connectingMessageShown = false;
+          Serial.println("[Display] Connection established - stopping Connecting...");
+          // Clear screen before first Companion update to avoid flickering
+          P.displayClear();
+        }
         parseAPI(line);
       }
     }
@@ -990,6 +1448,59 @@ void loop() {
       client.println("PING ledmatrix");
       lastPingTime = now;
     }
+  }
+
+  // Handle delayed brightness write (debounce) - runs regardless of connection status
+  if (brightnessWritePending) {
+    // Use overflow-safe time comparison
+    if ((long)(now - lastBrightnessChange) >= (long)brightnessWriteDelay) {
+      Serial.printf("[DEBUG] Brightness write after %lu ms delay\n", brightnessWriteDelay);
+      
+      // Check if brightness actually changed from EEPROM value to prevent unnecessary writes
+      EEPROM.begin(EEPROM_SIZE);
+      uint8_t storedBrightness = EEPROM.read(66);
+      EEPROM.end();
+      
+      if (storedBrightness != (uint8_t)brightness) {
+        eepromSaveCompanionConfig(companion_host, companion_port);
+        Serial.println("[EEPROM] Brightness written to EEPROM after debounce delay (value changed)");
+      } else {
+        Serial.println("[EEPROM] Brightness not written - value unchanged in EEPROM");
+      }
+      brightnessWritePending = false;
+    }
+  }
+
+  // Handle WiFi ! / MAC address alternation
+  // Only alternate when Companion is NOT connected AND first connection attempt has been made
+  // AND we're in alternation mode (either showing WiFi ! or MAC)
+  if (!client.connected() && firstConnectionAttemptMade && 
+      (currentText == "WiFi !" || currentText == macShort)) {
+    
+    // If we just switched to WiFi ! (from MAC), reset the timer
+    if (showMACAddress && currentText == "WiFi !") {
+      lastWiFiOKToggle = now;
+    }
+    
+    // If we just switched to MAC (from WiFi !), reset the timer
+    if (!showMACAddress && currentText == macShort) {
+      lastWiFiOKToggle = now;
+    }
+    
+    if ((long)(now - lastWiFiOKToggle) >= (long)wifiOKToggleDelay) {
+      lastWiFiOKToggle = now;
+      showMACAddress = !showMACAddress;
+      
+      if (showMACAddress) {
+        setTextNow(macShort);
+      } else {
+        setTextNow("WiFi !");
+      }
+    }
+  } else {
+    // Reset alternation when not showing WiFi ! or MAC or when Companion is connected
+    showMACAddress = false;
+    lastWiFiOKToggle = now;
   }
 
   // Apply any pending text changes
@@ -1006,8 +1517,8 @@ void loop() {
       P.displayReset();
     }
 
-    // Re-apply bars each animation step in bar modes
-    if (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM) {
+    // Re-apply bars each animation step in bar modes - only when Companion is connected
+    if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
       updateBackgroundBars(barLeftOn, barRightOn);
     }
   }
