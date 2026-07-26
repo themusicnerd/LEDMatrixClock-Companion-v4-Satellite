@@ -50,12 +50,12 @@ https://www.aliexpress.com/item/1005006038630745.html
 
 ### Initial install with ESPHome Web (recommended)
 
-1. Download the **ESP8266MOD 4 MB** `LEDMatrixClock-Companion-v4-Satellite.ino.bin` from the latest GitHub release.
+1. Download the **ESP8266MOD 4 MB** `LEDMatrixClock-Companion-v4-Satellite-factory.bin` from the latest GitHub release. This is the first-install serial-flash image.
 2. Connect the clock with a USB **data** cable and open [ESPHome Web](https://web.esphome.io/).
 3. Select **Connect**, choose the serial device, then choose **Install** and select the downloaded `.bin`.
 4. Complete Wi-Fi/Companion setup. Future updates use `http://<device-ip>:9999/update`—no USB cable required.
 
-ESPHome Web is used only as a browser serial flasher; this is not ESPHome firmware.
+There are two release files: `*-factory.bin` is for the first USB flash only; `*.ino.bin` is the application image for browser updates. This is not ESPHome firmware.
 
 ### Arduino development environment
 
