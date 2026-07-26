@@ -252,8 +252,12 @@ String decodeBase64(const String& input) {
 // ------------------------------------------------------------
 // EEPROM Helpers
 // ------------------------------------------------------------
+extern String firmwareUpdatePassword;
 void eepromLoadCompanionConfig() {
   EEPROM.begin(EEPROM_SIZE);
+  char updatePassword[33] = {};
+  for (uint8_t i = 0; i < 32; ++i) updatePassword[i] = EEPROM.read(70 + i);
+  firmwareUpdatePassword = String(updatePassword);
   if (EEPROM.read(0) == 'L' && EEPROM.read(1) == 'M') {
     // Valid header
     for (int i = 0; i < 40; i++) {
@@ -1395,21 +1399,22 @@ void handlePostConfig() {
 }
 
 const char* firmwareUpdateUser = "admin";
-const char* firmwareUpdatePassword = "companion-satellite";
+// Empty by default: updates are open until the owner elects to protect them.
+String firmwareUpdatePassword = "";
 
 bool requireFirmwareUpdateAuth() {
-  if (restServer.authenticate(firmwareUpdateUser, firmwareUpdatePassword)) return true;
+  if (firmwareUpdatePassword.length() == 0 || restServer.authenticate(firmwareUpdateUser, firmwareUpdatePassword.c_str())) return true;
   restServer.requestAuthentication();
   return false;
 }
 
 void handleFirmwareUpdatePage() {
   if (!requireFirmwareUpdateAuth()) return;
-  restServer.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h2>Firmware update</h2><p>Select the ESP8266MOD release application <code>.bin</code> file. Do not power off while updating.</p><form method=POST action=/update enctype=multipart/form-data><input type=file name=firmware accept='.bin' required><button type=submit>Install and reboot</button></form>");
+  restServer.send(200, "text/html", "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><h2>Firmware update</h2><p>Select the ESP8266MOD release application <code>.bin</code> file. Do not power off while updating.</p><form method=POST action=/update enctype=multipart/form-data><input type=file name=firmware accept='.bin' required><button type=submit>Install and reboot</button></form><hr><h3>Optional protection</h3><form method=POST action=/update/password><input type=password name=password placeholder='Leave blank to remove'><button type=submit>Save update password</button></form>");
 }
 
 void handleFirmwareUpload() {
-  if (!restServer.authenticate(firmwareUpdateUser, firmwareUpdatePassword)) return;
+  if (firmwareUpdatePassword.length() && !restServer.authenticate(firmwareUpdateUser, firmwareUpdatePassword.c_str())) return;
   HTTPUpload& upload = restServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     const size_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
@@ -1426,6 +1431,16 @@ void handleFirmwareUpdateResult() {
   if (success) { delay(500); ESP.restart(); }
 }
 
+void handleFirmwareUpdatePassword() {
+  if (!requireFirmwareUpdateAuth()) return;
+  firmwareUpdatePassword = restServer.arg("password");
+  firmwareUpdatePassword = firmwareUpdatePassword.substring(0, 32);
+  EEPROM.begin(EEPROM_SIZE);
+  for (uint8_t i = 0; i < 33; ++i) EEPROM.write(70 + i, i < firmwareUpdatePassword.length() ? firmwareUpdatePassword[i] : 0);
+  EEPROM.commit(); EEPROM.end();
+  restServer.send(200, "text/plain", firmwareUpdatePassword.length() ? "Update password saved." : "Update password removed.");
+}
+
 void setupRestAPI() {
   // Register endpoints
   restServer.on("/api/host", HTTP_GET, handleGetHost);
@@ -1437,6 +1452,7 @@ void setupRestAPI() {
   restServer.on("/api/config", HTTP_POST, handlePostConfig);
   restServer.on("/update", HTTP_GET, handleFirmwareUpdatePage);
   restServer.on("/update", HTTP_POST, handleFirmwareUpdateResult, handleFirmwareUpload);
+  restServer.on("/update/password", HTTP_POST, handleFirmwareUpdatePassword);
   
   // Start server
   restServer.begin();

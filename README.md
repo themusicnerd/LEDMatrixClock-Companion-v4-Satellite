@@ -160,7 +160,7 @@ which means it can be driven by: Variables & Custom Actions!
 
 1. Download the **ESP8266MOD 4 MB** `LEDMatrixClock-Companion-v4-Satellite.ino.bin` from a GitHub release.
 2. Browse to `http://<device-ip>:9999/update` while connected to the same network.
-3. Sign in with username `admin` and password `companion-satellite`.
+3. Updates are open by default. Use the optional protection form on that page to set a password; once set, sign in as `admin` with that password.
 4. Select the `.bin`, upload it, and wait for the automatic reboot. Do not remove power during the update.
 
 Upload only the release application `.bin`; serial flash images and files made for a different flash layout are not suitable for browser updates.
