@@ -35,7 +35,7 @@
   Library Modification:
     - ESP8266mDNS library modified to increase MDNS_SERVICE_NAME_LENGTH
     - Changed from 15 to 25 characters in LEAmDNS.h line 161
-    - Required to support "companion-satellite" service name (17 chars)
+    - Required to support "companion-satellite" service name (19 chars)
     - Without this modification, service registration fails due to length validation
   ------------------------------------------------------------
 */
@@ -51,6 +51,12 @@
 #include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
 
+// The stock ESP8266 core limits mDNS service labels to 15 characters, while
+// Companion discovers `_companion-satellite._tcp` (19 characters).
+#if defined(MDNS_SERVICE_NAME_LENGTH) && MDNS_SERVICE_NAME_LENGTH < 19
+#warning "Patch ESP8266mDNS MDNS_SERVICE_NAME_LENGTH to at least 19; see patches/esp8266-mdns-service-name-length.patch"
+#endif
+
 // ------------------------ MATRIX CONFIG ---------------------
 
 #define HARDWARE_TYPE MD_MAX72XX::PAROLA_HW
@@ -60,6 +66,7 @@
 #define PIN_CS   15    // D8 on many dev boards
 #define PIN_CLK  14    // D5
 #define PIN_DIN  13    // D7
+#define PIN_DOWNLOAD 0 // GPIO0 / D3: DOWNLOAD button, active-low after boot
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, PIN_CS, MAX_DEVICES);
 // Underlying MAX72xx object for direct column control (bars)
@@ -125,6 +132,14 @@ WiFiManagerParameter* custom_bgMode;     // background handling mode
 
 // Device ID and hostname
 String deviceID;
+bool mdnsStarted = false;
+
+// GPIO0 is a boot strap pin: holding DOWNLOAD while resetting starts the
+// serial bootloader. Once the sketch is running, a deliberate long press is
+// safe to use as the configuration trigger.
+const unsigned long downloadButtonHoldMs = 2000;
+unsigned long downloadButtonPressedAt = 0;
+bool downloadButtonHandled = false;
 
 // AP password for config portal (blank = open)
 const char* AP_password = "";
@@ -139,6 +154,13 @@ const char* AP_password = "";
 // [60]     = bootCounter
 const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_BOOT_ADDR = 60;
+const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
+
+enum StartupAction : uint8_t {
+  STARTUP_NORMAL = 0,
+  STARTUP_WEB_CONFIG = 1,
+  STARTUP_WIFI_AP = 2,
+};
 
 // Timing / connection
 unsigned long lastPingTime     = 0;
@@ -311,6 +333,23 @@ void eepromWriteBootCounter(uint8_t c) {
   bool commitResult = EEPROM.commit();
   EEPROM.end();
   Serial.printf("[EEPROM] Write boot counter: %u, commit result: %s\n", c, commitResult ? "SUCCESS" : "FAILED");
+}
+
+StartupAction eepromReadStartupAction() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t value = EEPROM.read(EEPROM_STARTUP_ACTION_ADDR);
+  EEPROM.end();
+
+  return value == STARTUP_WEB_CONFIG ? STARTUP_WEB_CONFIG
+       : value == STARTUP_WIFI_AP ? STARTUP_WIFI_AP
+       : STARTUP_NORMAL;
+}
+
+void eepromWriteStartupAction(StartupAction action) {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.write(EEPROM_STARTUP_ACTION_ADDR, action);
+  EEPROM.commit();
+  EEPROM.end();
 }
 
 // ------------------------------------------------------------
@@ -867,6 +906,174 @@ void startConfigPortal() {
   delay(1000);
 }
 
+void animateMenuDisplay() {
+  if (P.displayAnimate() && textScrolls) P.displayReset();
+  yield();
+}
+
+void waitForDownloadButtonRelease() {
+  while (digitalRead(PIN_DOWNLOAD) == LOW) {
+    animateMenuDisplay();
+  }
+  delay(40);  // debounce the release before accepting a menu press
+}
+
+void factoryReset() {
+  Serial.println("[Setup] Factory reset requested");
+  showBootMessage("RESET");
+
+  wifiManager.resetSettings();
+
+  EEPROM.begin(EEPROM_SIZE);
+  for (uint16_t address = 0; address < EEPROM_SIZE; address++) {
+    EEPROM.write(address, 0);
+  }
+  EEPROM.commit();
+  EEPROM.end();
+
+  delay(750);
+  ESP.restart();
+}
+
+void startWebConfigPortal() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Setup] No WiFi for web config; opening WiFi AP instead");
+    startConfigPortal();
+    ESP.restart();
+  }
+
+  Serial.println("[Setup] Starting web configuration portal");
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.startWebPortal();
+  showBootMessage(String("WEB ") + WiFi.localIP().toString());
+  waitForDownloadButtonRelease();
+
+  unsigned long pressedAt = 0;
+  while (true) {
+    wifiManager.process();
+    animateMenuDisplay();
+
+    if (digitalRead(PIN_DOWNLOAD) == LOW) {
+      if (pressedAt == 0) pressedAt = millis();
+      if (millis() - pressedAt >= downloadButtonHoldMs) {
+        Serial.println("[Setup] Closing web configuration portal");
+        wifiManager.stopWebPortal();
+        ESP.restart();
+      }
+    } else {
+      pressedAt = 0;
+    }
+  }
+}
+
+void runSetupMenu() {
+  static const char* const menuLabels[] = { "NORMAL", "WEB CFG", "WIFI AP", "RESET" };
+  const uint8_t menuCount = sizeof(menuLabels) / sizeof(menuLabels[0]);
+  uint8_t selected = 0;
+
+  Serial.println("[Setup] Menu: short press = next, hold 2s = select");
+  showBootMessage(menuLabels[selected]);
+  waitForDownloadButtonRelease();
+
+  unsigned long pressedAt = 0;
+  bool wasPressed = false;
+
+  while (true) {
+    animateMenuDisplay();
+    bool pressed = digitalRead(PIN_DOWNLOAD) == LOW;
+
+    if (pressed && !wasPressed) {
+      pressedAt = millis();
+    } else if (!pressed && wasPressed) {
+      if (millis() - pressedAt < downloadButtonHoldMs) {
+        selected = (selected + 1) % menuCount;
+        showBootMessage(menuLabels[selected]);
+        Serial.printf("[Setup] Selected %s\n", menuLabels[selected]);
+      }
+      pressedAt = 0;
+    }
+
+    if (pressed && pressedAt != 0 && millis() - pressedAt >= downloadButtonHoldMs) {
+      Serial.printf("[Setup] Selected %s\n", menuLabels[selected]);
+      waitForDownloadButtonRelease();
+      wasPressed = false;
+      pressedAt = 0;
+
+      switch (selected) {
+        case 0:  // Normal boot
+          return;
+
+        case 1:  // Web config on the current WiFi network
+          eepromWriteStartupAction(STARTUP_WEB_CONFIG);
+          ESP.restart();
+          break;
+
+        case 2:  // WiFi AP configuration portal
+          eepromWriteStartupAction(STARTUP_WIFI_AP);
+          ESP.restart();
+          break;
+
+        case 3: {  // Factory reset requires a second explicit confirmation
+          bool confirm = false;
+          showBootMessage("NO RESET");
+          Serial.println("[Setup] Factory reset: short press toggles NO/YES, hold 2s confirms");
+
+          while (true) {
+            animateMenuDisplay();
+            bool confirmPressed = digitalRead(PIN_DOWNLOAD) == LOW;
+
+            if (confirmPressed && !wasPressed) {
+              pressedAt = millis();
+            } else if (!confirmPressed && wasPressed) {
+              if (millis() - pressedAt < downloadButtonHoldMs) {
+                confirm = !confirm;
+                showBootMessage(confirm ? "YES RESET" : "NO RESET");
+              }
+              pressedAt = 0;
+            }
+
+            if (confirmPressed && pressedAt != 0 && millis() - pressedAt >= downloadButtonHoldMs) {
+              waitForDownloadButtonRelease();
+              if (confirm) factoryReset();
+
+              showBootMessage(menuLabels[selected]);
+              break;
+            }
+
+            wasPressed = confirmPressed;
+          }
+          break;
+        }
+      }
+    }
+
+    wasPressed = pressed;
+  }
+}
+
+void handleDownloadButton(unsigned long now) {
+  if (downloadButtonHandled) return;
+
+  if (digitalRead(PIN_DOWNLOAD) == LOW) {
+    if (downloadButtonPressedAt == 0) {
+      downloadButtonPressedAt = now;
+      return;
+    }
+
+    if (now - downloadButtonPressedAt >= downloadButtonHoldMs) {
+      downloadButtonHandled = true;
+      Serial.println("[Button] DOWNLOAD held for 2 seconds; opening setup menu");
+
+      if (client.connected()) client.stop();
+      runSetupMenu();
+      downloadButtonHandled = false;
+      downloadButtonPressedAt = 0;
+    }
+  } else {
+    downloadButtonPressedAt = 0;
+  }
+}
+
 // ------------------------------------------------------------
 // WiFi / Initial Config logic
 // ------------------------------------------------------------
@@ -1209,6 +1416,47 @@ void setupRestAPI() {
 }
 
 // ------------------------------------------------------------
+// Companion mDNS discovery
+// ------------------------------------------------------------
+
+void setupMDNS() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[mDNS] WiFi is not connected; discovery unavailable");
+    return;
+  }
+
+  String mDNSHostname = "led-matrix_" + macShort;
+  Serial.printf("[mDNS] Starting responder as %s.local\n", mDNSHostname.c_str());
+
+  if (!MDNS.begin(mDNSHostname.c_str())) {
+    Serial.println("[mDNS] ERROR: responder failed to start");
+    return;
+  }
+
+  String mDNSInstanceName = "led-matrix:" + macShort;
+  MDNS.setInstanceName(mDNSInstanceName);
+
+  if (!MDNS.addService("companion-satellite", "tcp", 9999)) {
+    Serial.println("[mDNS] ERROR: could not register companion-satellite service");
+    Serial.println("[mDNS] The stock ESP8266mDNS library has a 15-character service-name limit.");
+    Serial.println("[mDNS] Apply patches/esp8266-mdns-service-name-length.patch and rebuild the ESP8266 core.");
+    return;
+  }
+
+  // `restEnabled` is the field Companion uses to enable one-click setup via
+  // POST /api/config. The remaining fields align this advertisement with the
+  // AtomS3 satellite and make the service self-describing to mDNS browsers.
+  MDNS.addServiceTxt("companion-satellite", "tcp", "restEnabled", "true");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "deviceId", macShort);
+  MDNS.addServiceTxt("companion-satellite", "tcp", "prefix", "led-matrix");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "productName", "LED Matrix");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "apiVersion", "4");
+
+  mdnsStarted = true;
+  Serial.printf("[mDNS] Advertising %s on port 9999\n", mDNSInstanceName.c_str());
+}
+
+// ------------------------------------------------------------
 // SETUP
 // ------------------------------------------------------------
 
@@ -1220,6 +1468,10 @@ void setup() {
   // Build deviceID from MAC: LED_Matrix_<MAC>
   WiFi.mode(WIFI_STA);
   delay(100);
+
+  // Do not hold DOWNLOAD during reset: GPIO0 must be high for normal boot.
+  // After boot, its button can safely be read as an active-low config trigger.
+  pinMode(PIN_DOWNLOAD, INPUT_PULLUP);
 
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -1264,6 +1516,16 @@ void setup() {
   // Ensure bars are off at boot
   updateBackgroundBars(false, false);
 
+  StartupAction startupAction = eepromReadStartupAction();
+  eepromWriteStartupAction(STARTUP_NORMAL);  // consume one-time menu action
+
+  if (startupAction == STARTUP_WIFI_AP) {
+    Serial.println("[Setup] Opening WiFi AP from setup menu");
+    eepromWriteBootCounter(0);
+    startConfigPortal();
+    ESP.restart();
+  }
+
   // --------------------------------------------------------
   // Simplified boot counter logic:
   //  - 0 → Hello! → write 1
@@ -1273,14 +1535,13 @@ void setup() {
   bootCountCached = eepromReadBootCounter();
   Serial.printf("[Boot] Boot counter read: %u\n", bootCountCached);
   
-  if (bootCountCached == 1) {
+  if (bootCountCached == 1 && startupAction != STARTUP_WEB_CONFIG) {
     // Boot counter 1 → trigger config portal
     Serial.println("[Boot] Boot counter 1 → triggering config portal");
     eepromWriteBootCounter(0);  // Reset immediately
     bootCountCached = 0;
     startConfigPortal();
-    // startConfigPortal() will handle CFG ! display
-    return;  // Skip Hello! logic
+    ESP.restart();
   } else {
     // Boot counter 0 (or any other value) → normal boot with Hello!
     Serial.println("[Boot] Boot counter 0 → normal boot with Hello!");
@@ -1309,63 +1570,17 @@ void setup() {
   bootCountCached = 0;
   Serial.println("[Boot] Hello! timeout - boot counter reset to 0");
 
-  // WiFi + config (with boot counter logic via bootCountCached)
+  // WiFi + config
   connectToNetwork();
 
-  // Initialize mDNS service after WiFi is connected
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[mDNS] Starting mDNS service...");
-    
-    // Wait a bit for WiFi to fully stabilize
-    delay(1000);
-    
-    // Start mDNS with underscore hostname format
-    String mDNSHostname = "led-matrix_" + macShort;
-    if (!MDNS.begin(mDNSHostname.c_str())) {
-      Serial.println("[mDNS] Error setting up mDNS responder!");
-    } else {
-      Serial.println("[mDNS] mDNS responder started");
-      Serial.printf("[mDNS] Hostname: %s.local\n", mDNSHostname.c_str());
-      Serial.printf("[mDNS] IP Address: %s\n", WiFi.localIP().toString().c_str());
-      
-      // Set instance name using shortened MAC (last 5 chars) with colon format
-      String mDNSInstanceName = "led-matrix:" + macShort;
-      MDNS.setInstanceName(mDNSInstanceName);
-      Serial.printf("[mDNS] Instance name set to: %s\n", mDNSInstanceName.c_str());
-      
-      // Add service with companion-satellite name (17 chars - supported after library modification)
-      // Library MDNS_SERVICE_NAME_LENGTH increased from 15 to 25 to allow hyphenated service names
-      bool serviceAdded = MDNS.addService("companion-satellite", "tcp", 9999);
-      
-      if (serviceAdded) {
-        Serial.println("[mDNS] SUCCESS: companion-satellite service registered!");
-        Serial.println("[mDNS] Library modification successful - hyphenated service names now supported");
-        
-        // Add TXT record
-        MDNS.addServiceTxt("companion-satellite", "tcp", "restEnabled", "true");
-        Serial.println("[mDNS] Added restEnabled=true to companion-satellite service");
-        
-        // Force mDNS updates
-        for (int i = 0; i < 3; i++) {
-          MDNS.update();
-          delay(1000);
-          Serial.printf("[mDNS] Update %d/3 completed\n", i+1);
-        }
-        
-        Serial.println("[mDNS] Setup complete - service discoverable");
-        Serial.println("[mDNS] Test with: dns-sd -B companion-satellite._tcp");
-        Serial.println("[mDNS] SUCCESS: Full companion-satellite service name working!");
-        
-      } else {
-        Serial.println("[mDNS] ERROR: companion-satellite service registration failed!");
-        Serial.println("[mDNS] Library modification may not be sufficient - need further investigation");
-        return;
-      }
-    }
-  }
-
-  // Start REST API server
+  // The REST API must be ready before we advertise the service: Companion's
+  // auto-setup immediately POSTs the selected device's Companion host/port.
   setupRestAPI();
+  setupMDNS();
+
+  if (startupAction == STARTUP_WEB_CONFIG) {
+    startWebConfigPortal();
+  }
 
   Serial.println("[System] Setup complete, entering loop");
 }
@@ -1377,8 +1592,10 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Handle mDNS updates (non-blocking)
-  MDNS.update();
+  handleDownloadButton(now);
+
+  // Handle mDNS updates only after a successful responder setup.
+  if (mdnsStarted) MDNS.update();
 
   // Handle REST API requests
   restServer.handleClient();

@@ -18,7 +18,8 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 - ✅ **Brightness** control via Companion BRIGHTNESS (0–100 → 0–15 LED intensity)
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
-- ✅ **Boot counter** to force config mode with repeated resets
+- ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
+- ✅ AtomS3-style setup menu via a two-second **DOWNLOAD** button hold after boot
 - ✅ Designed for cheap LED matrix clocks based on ESP8266 from AliExpress
 
 ---
@@ -63,6 +64,10 @@ Install the following libraries via **Sketch > Include Library > Manage Librarie
 
 After installing these libraries, you should be able to compile and upload the firmware.
 
+### Required mDNS core patch
+
+Companion discovers satellites via `_companion-satellite._tcp`. The stock ESP8266 mDNS core limits service names to 15 characters, while `companion-satellite` is 19 characters. Apply [patches/esp8266-mdns-service-name-length.patch](patches/esp8266-mdns-service-name-length.patch) to `libraries/ESP8266mDNS/src/LEAmDNS.h` in the installed ESP8266 board package, then rebuild/upload. The firmware emits a compile warning and a serial error if that patch is missing.
+
 ## Connecting to Wi-Fi / Companion
 
 The device boots and attempts Wi-Fi and Companion automatically.
@@ -86,7 +91,16 @@ The device boots and attempts Wi-Fi and Companion automatically.
 
 ## Entering Config Portal
 
-On boot if you see CONFIG? and you reset while it is scrolling, you will enter WiFi Manager config mode and display CFG! on the LED Matrix.
+After a normal boot, hold the **DOWNLOAD** button for two seconds to open the setup menu. Short-press to cycle the selection and hold DOWNLOAD for two seconds to select it:
+
+- `NORMAL` — exit the menu and continue running.
+- `WEB CFG` — open WiFiManager’s web configuration portal on the current Wi-Fi network; hold DOWNLOAD for two seconds to close it and reboot.
+- `WIFI AP` — start the `led-matrix_XXXXX` Wi-Fi configuration access point.
+- `RESET` — factory reset saved Wi-Fi, Companion, and display settings. This requires a second confirmation: short-press to change `NO RESET` to `YES RESET`, then hold DOWNLOAD for two seconds.
+
+Do **not** hold DOWNLOAD while pressing RESET: it is connected to GPIO0 and will put the ESP8266 into the serial flashing bootloader instead of running the firmware.
+
+The original reset-count fallback remains available: reset the device while `CONFIG?` is scrolling, then it will enter WiFi Manager config mode on the next boot and display `CFG !`.
 - Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
 - It should take you to 192.168.4.1 (if not, go there)
 - Setup the Companion IP, Companion Port, set the mode you want, and set Boot to 0
@@ -122,6 +136,7 @@ Settings save to EEPROM.
 In Companion v4:
 - It should automatically show up as Satellite Surface
 - Assign the button offset in Surfaces
+- Select the discovered device and let Companion configure its own host/port through the satellite REST API. Manual Companion IP/port configuration remains available as a fallback.
 
 ## The device appears as:
 
