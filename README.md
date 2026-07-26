@@ -19,7 +19,7 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
 - ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
-- ✅ **Boot counter** to force config mode with repeated resets
+- ✅ Setup entry via a two-second **DOWNLOAD** button hold after boot, with reset-count fallback
 - ✅ Designed for cheap LED matrix clocks based on ESP8266 from AliExpress
 
 ---
@@ -91,7 +91,11 @@ The device boots and attempts Wi-Fi and Companion automatically.
 
 ## Entering Config Portal
 
-On boot if you see CONFIG? and you reset while it is scrolling, you will enter WiFi Manager config mode and display CFG! on the LED Matrix.
+After a normal boot, hold the **DOWNLOAD** button for two seconds to enter WiFi Manager config mode. The device displays `CFG !`, opens its configuration AP, and restarts after the portal exits so the new settings are applied.
+
+Do **not** hold DOWNLOAD while pressing RESET: it is connected to GPIO0 and will put the ESP8266 into the serial flashing bootloader instead of running the firmware.
+
+The original reset-count fallback remains available: reset the device while `CONFIG?` is scrolling, then it will enter WiFi Manager config mode on the next boot and display `CFG !`.
 - Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
 - It should take you to 192.168.4.1 (if not, go there)
 - Setup the Companion IP, Companion Port, set the mode you want, and set Boot to 0

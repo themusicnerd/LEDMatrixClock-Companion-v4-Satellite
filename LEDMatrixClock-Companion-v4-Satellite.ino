@@ -66,6 +66,7 @@
 #define PIN_CS   15    // D8 on many dev boards
 #define PIN_CLK  14    // D5
 #define PIN_DIN  13    // D7
+#define PIN_DOWNLOAD 0 // GPIO0 / D3: DOWNLOAD button, active-low after boot
 
 MD_Parola P = MD_Parola(HARDWARE_TYPE, PIN_CS, MAX_DEVICES);
 // Underlying MAX72xx object for direct column control (bars)
@@ -132,6 +133,13 @@ WiFiManagerParameter* custom_bgMode;     // background handling mode
 // Device ID and hostname
 String deviceID;
 bool mdnsStarted = false;
+
+// GPIO0 is a boot strap pin: holding DOWNLOAD while resetting starts the
+// serial bootloader. Once the sketch is running, a deliberate long press is
+// safe to use as the configuration trigger.
+const unsigned long downloadButtonHoldMs = 2000;
+unsigned long downloadButtonPressedAt = 0;
+bool downloadButtonHandled = false;
 
 // AP password for config portal (blank = open)
 const char* AP_password = "";
@@ -874,6 +882,32 @@ void startConfigPortal() {
   delay(1000);
 }
 
+void handleDownloadButton(unsigned long now) {
+  if (downloadButtonHandled) return;
+
+  if (digitalRead(PIN_DOWNLOAD) == LOW) {
+    if (downloadButtonPressedAt == 0) {
+      downloadButtonPressedAt = now;
+      return;
+    }
+
+    if (now - downloadButtonPressedAt >= downloadButtonHoldMs) {
+      downloadButtonHandled = true;
+      Serial.println("[Button] DOWNLOAD held for 2 seconds; opening config portal");
+
+      if (client.connected()) client.stop();
+      startConfigPortal();
+
+      // WiFiManager may have changed WiFi credentials or the Companion host.
+      // Restart so the REST server, mDNS responder, and TCP client all start
+      // from a known-good state with the saved settings.
+      ESP.restart();
+    }
+  } else {
+    downloadButtonPressedAt = 0;
+  }
+}
+
 // ------------------------------------------------------------
 // WiFi / Initial Config logic
 // ------------------------------------------------------------
@@ -1269,6 +1303,10 @@ void setup() {
   WiFi.mode(WIFI_STA);
   delay(100);
 
+  // Do not hold DOWNLOAD during reset: GPIO0 must be high for normal boot.
+  // After boot, its button can safely be read as an active-low config trigger.
+  pinMode(PIN_DOWNLOAD, INPUT_PULLUP);
+
   uint8_t mac[6];
   WiFi.macAddress(mac);
 
@@ -1374,6 +1412,8 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  handleDownloadButton(now);
 
   // Handle mDNS updates only after a successful responder setup.
   if (mdnsStarted) MDNS.update();
