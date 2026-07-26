@@ -18,6 +18,7 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 - ✅ **Brightness** control via Companion BRIGHTNESS (0–100 → 0–15 LED intensity)
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
+- ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
 - ✅ **Boot counter** to force config mode with repeated resets
 - ✅ Designed for cheap LED matrix clocks based on ESP8266 from AliExpress
 
@@ -62,6 +63,10 @@ Install the following libraries via **Sketch > Include Library > Manage Librarie
 3. **MD_MAX72XX** by MajicDesigns
 
 After installing these libraries, you should be able to compile and upload the firmware.
+
+### Required mDNS core patch
+
+Companion discovers satellites via `_companion-satellite._tcp`. The stock ESP8266 mDNS core limits service names to 15 characters, while `companion-satellite` is 19 characters. Apply [patches/esp8266-mdns-service-name-length.patch](patches/esp8266-mdns-service-name-length.patch) to `libraries/ESP8266mDNS/src/LEAmDNS.h` in the installed ESP8266 board package, then rebuild/upload. The firmware emits a compile warning and a serial error if that patch is missing.
 
 ## Connecting to Wi-Fi / Companion
 
@@ -122,6 +127,7 @@ Settings save to EEPROM.
 In Companion v4:
 - It should automatically show up as Satellite Surface
 - Assign the button offset in Surfaces
+- Select the discovered device and let Companion configure its own host/port through the satellite REST API. Manual Companion IP/port configuration remains available as a fallback.
 
 ## The device appears as:
 

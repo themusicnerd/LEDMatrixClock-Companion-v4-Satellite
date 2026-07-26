@@ -1,0 +1,11 @@
+--- a/libraries/ESP8266mDNS/src/LEAmDNS.h
++++ b/libraries/ESP8266mDNS/src/LEAmDNS.h
+@@ -158,7 +158,7 @@
+ /*
+     Maximum length of a service name eg. http
+ */
+-#define MDNS_SERVICE_NAME_LENGTH 15
++#define MDNS_SERVICE_NAME_LENGTH 25
+ /*
+     Maximum length of a service protocol name eg. tcp
+ */

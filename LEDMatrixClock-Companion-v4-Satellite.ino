@@ -35,7 +35,7 @@
   Library Modification:
     - ESP8266mDNS library modified to increase MDNS_SERVICE_NAME_LENGTH
     - Changed from 15 to 25 characters in LEAmDNS.h line 161
-    - Required to support "companion-satellite" service name (17 chars)
+    - Required to support "companion-satellite" service name (19 chars)
     - Without this modification, service registration fails due to length validation
   ------------------------------------------------------------
 */
@@ -50,6 +50,12 @@
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ESP8266WebServer.h>
+
+// The stock ESP8266 core limits mDNS service labels to 15 characters, while
+// Companion discovers `_companion-satellite._tcp` (19 characters).
+#if defined(MDNS_SERVICE_NAME_LENGTH) && MDNS_SERVICE_NAME_LENGTH < 19
+#warning "Patch ESP8266mDNS MDNS_SERVICE_NAME_LENGTH to at least 19; see patches/esp8266-mdns-service-name-length.patch"
+#endif
 
 // ------------------------ MATRIX CONFIG ---------------------
 
@@ -125,6 +131,7 @@ WiFiManagerParameter* custom_bgMode;     // background handling mode
 
 // Device ID and hostname
 String deviceID;
+bool mdnsStarted = false;
 
 // AP password for config portal (blank = open)
 const char* AP_password = "";
@@ -1209,6 +1216,47 @@ void setupRestAPI() {
 }
 
 // ------------------------------------------------------------
+// Companion mDNS discovery
+// ------------------------------------------------------------
+
+void setupMDNS() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[mDNS] WiFi is not connected; discovery unavailable");
+    return;
+  }
+
+  String mDNSHostname = "led-matrix_" + macShort;
+  Serial.printf("[mDNS] Starting responder as %s.local\n", mDNSHostname.c_str());
+
+  if (!MDNS.begin(mDNSHostname.c_str())) {
+    Serial.println("[mDNS] ERROR: responder failed to start");
+    return;
+  }
+
+  String mDNSInstanceName = "led-matrix:" + macShort;
+  MDNS.setInstanceName(mDNSInstanceName);
+
+  if (!MDNS.addService("companion-satellite", "tcp", 9999)) {
+    Serial.println("[mDNS] ERROR: could not register companion-satellite service");
+    Serial.println("[mDNS] The stock ESP8266mDNS library has a 15-character service-name limit.");
+    Serial.println("[mDNS] Apply patches/esp8266-mdns-service-name-length.patch and rebuild the ESP8266 core.");
+    return;
+  }
+
+  // `restEnabled` is the field Companion uses to enable one-click setup via
+  // POST /api/config. The remaining fields align this advertisement with the
+  // AtomS3 satellite and make the service self-describing to mDNS browsers.
+  MDNS.addServiceTxt("companion-satellite", "tcp", "restEnabled", "true");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "deviceId", macShort);
+  MDNS.addServiceTxt("companion-satellite", "tcp", "prefix", "led-matrix");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "productName", "LED Matrix");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "apiVersion", "4");
+
+  mdnsStarted = true;
+  Serial.printf("[mDNS] Advertising %s on port 9999\n", mDNSInstanceName.c_str());
+}
+
+// ------------------------------------------------------------
 // SETUP
 // ------------------------------------------------------------
 
@@ -1312,60 +1360,10 @@ void setup() {
   // WiFi + config (with boot counter logic via bootCountCached)
   connectToNetwork();
 
-  // Initialize mDNS service after WiFi is connected
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[mDNS] Starting mDNS service...");
-    
-    // Wait a bit for WiFi to fully stabilize
-    delay(1000);
-    
-    // Start mDNS with underscore hostname format
-    String mDNSHostname = "led-matrix_" + macShort;
-    if (!MDNS.begin(mDNSHostname.c_str())) {
-      Serial.println("[mDNS] Error setting up mDNS responder!");
-    } else {
-      Serial.println("[mDNS] mDNS responder started");
-      Serial.printf("[mDNS] Hostname: %s.local\n", mDNSHostname.c_str());
-      Serial.printf("[mDNS] IP Address: %s\n", WiFi.localIP().toString().c_str());
-      
-      // Set instance name using shortened MAC (last 5 chars) with colon format
-      String mDNSInstanceName = "led-matrix:" + macShort;
-      MDNS.setInstanceName(mDNSInstanceName);
-      Serial.printf("[mDNS] Instance name set to: %s\n", mDNSInstanceName.c_str());
-      
-      // Add service with companion-satellite name (17 chars - supported after library modification)
-      // Library MDNS_SERVICE_NAME_LENGTH increased from 15 to 25 to allow hyphenated service names
-      bool serviceAdded = MDNS.addService("companion-satellite", "tcp", 9999);
-      
-      if (serviceAdded) {
-        Serial.println("[mDNS] SUCCESS: companion-satellite service registered!");
-        Serial.println("[mDNS] Library modification successful - hyphenated service names now supported");
-        
-        // Add TXT record
-        MDNS.addServiceTxt("companion-satellite", "tcp", "restEnabled", "true");
-        Serial.println("[mDNS] Added restEnabled=true to companion-satellite service");
-        
-        // Force mDNS updates
-        for (int i = 0; i < 3; i++) {
-          MDNS.update();
-          delay(1000);
-          Serial.printf("[mDNS] Update %d/3 completed\n", i+1);
-        }
-        
-        Serial.println("[mDNS] Setup complete - service discoverable");
-        Serial.println("[mDNS] Test with: dns-sd -B companion-satellite._tcp");
-        Serial.println("[mDNS] SUCCESS: Full companion-satellite service name working!");
-        
-      } else {
-        Serial.println("[mDNS] ERROR: companion-satellite service registration failed!");
-        Serial.println("[mDNS] Library modification may not be sufficient - need further investigation");
-        return;
-      }
-    }
-  }
-
-  // Start REST API server
+  // The REST API must be ready before we advertise the service: Companion's
+  // auto-setup immediately POSTs the selected device's Companion host/port.
   setupRestAPI();
+  setupMDNS();
 
   Serial.println("[System] Setup complete, entering loop");
 }
@@ -1377,8 +1375,8 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // Handle mDNS updates (non-blocking)
-  MDNS.update();
+  // Handle mDNS updates only after a successful responder setup.
+  if (mdnsStarted) MDNS.update();
 
   // Handle REST API requests
   restServer.handleClient();
