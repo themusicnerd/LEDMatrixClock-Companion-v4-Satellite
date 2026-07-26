@@ -155,3 +155,16 @@ which means it can be driven by: Variables & Custom Actions!
 - Updates do not flicker
 - BRIGHTNESS 0–100 maps to matrix intensity 0–15
 - “Waiting…” appears until Companion connects
+
+## Browser Firmware Update
+
+1. Download the **ESP8266MOD 4 MB** `LEDMatrixClock-Companion-v4-Satellite.ino.bin` from a GitHub release.
+2. Browse to `http://<device-ip>:9999/update` while connected to the same network.
+3. Sign in with username `admin` and password `companion-satellite`.
+4. Select the `.bin`, upload it, and wait for the automatic reboot. Do not remove power during the update.
+
+Upload only the release application `.bin`; serial flash images and files made for a different flash layout are not suitable for browser updates.
+
+## Companion discovery and setup menu
+
+The satellite advertises `companion-satellite._tcp` with AtomS3-compatible metadata, so Companion can discover and configure it automatically. Hold **DOWNLOAD** for two seconds after boot to open the setup menu; choose normal boot, Web Config, Wi-Fi AP, or Factory Reset. The display modes are `none`, `invert`, `bars`, `pgmpvw`, and `pvwpgm`.
