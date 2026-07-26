@@ -48,6 +48,17 @@ https://www.aliexpress.com/item/1005006038630745.html
 
 ## Arduino IDE Setup
 
+### Initial install with ESPHome Web (recommended)
+
+1. Download the **ESP8266MOD 4 MB** `LEDMatrixClock-Companion-v4-Satellite.ino.bin` from the latest GitHub release.
+2. Connect the clock with a USB **data** cable and open [ESPHome Web](https://web.esphome.io/).
+3. Select **Connect**, choose the serial device, then choose **Install** and select the downloaded `.bin`.
+4. Complete Wi-Fi/Companion setup. Future updates use `http://<device-ip>:9999/update`—no USB cable required.
+
+ESPHome Web is used only as a browser serial flasher; this is not ESPHome firmware.
+
+### Arduino development environment
+
 Before uploading the firmware, you need to install the ESP8266 board support in Arduino IDE:
 
 1. Start Arduino and open the Preferences window
