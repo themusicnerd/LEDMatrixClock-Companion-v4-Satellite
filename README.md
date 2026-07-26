@@ -19,7 +19,7 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
 - ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
-- ✅ Setup entry via a two-second **DOWNLOAD** button hold after boot, with reset-count fallback
+- ✅ AtomS3-style setup menu via a two-second **DOWNLOAD** button hold after boot
 - ✅ Designed for cheap LED matrix clocks based on ESP8266 from AliExpress
 
 ---
@@ -91,7 +91,12 @@ The device boots and attempts Wi-Fi and Companion automatically.
 
 ## Entering Config Portal
 
-After a normal boot, hold the **DOWNLOAD** button for two seconds to enter WiFi Manager config mode. The device displays `CFG !`, opens its configuration AP, and restarts after the portal exits so the new settings are applied.
+After a normal boot, hold the **DOWNLOAD** button for two seconds to open the setup menu. Short-press to cycle the selection and hold DOWNLOAD for two seconds to select it:
+
+- `NORMAL` — exit the menu and continue running.
+- `WEB CFG` — open WiFiManager’s web configuration portal on the current Wi-Fi network; hold DOWNLOAD for two seconds to close it and reboot.
+- `WIFI AP` — start the `led-matrix_XXXXX` Wi-Fi configuration access point.
+- `RESET` — factory reset saved Wi-Fi, Companion, and display settings. This requires a second confirmation: short-press to change `NO RESET` to `YES RESET`, then hold DOWNLOAD for two seconds.
 
 Do **not** hold DOWNLOAD while pressing RESET: it is connected to GPIO0 and will put the ESP8266 into the serial flashing bootloader instead of running the firmware.
 

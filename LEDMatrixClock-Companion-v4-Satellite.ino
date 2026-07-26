@@ -154,6 +154,13 @@ const char* AP_password = "";
 // [60]     = bootCounter
 const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_BOOT_ADDR = 60;
+const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
+
+enum StartupAction : uint8_t {
+  STARTUP_NORMAL = 0,
+  STARTUP_WEB_CONFIG = 1,
+  STARTUP_WIFI_AP = 2,
+};
 
 // Timing / connection
 unsigned long lastPingTime     = 0;
@@ -326,6 +333,23 @@ void eepromWriteBootCounter(uint8_t c) {
   bool commitResult = EEPROM.commit();
   EEPROM.end();
   Serial.printf("[EEPROM] Write boot counter: %u, commit result: %s\n", c, commitResult ? "SUCCESS" : "FAILED");
+}
+
+StartupAction eepromReadStartupAction() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t value = EEPROM.read(EEPROM_STARTUP_ACTION_ADDR);
+  EEPROM.end();
+
+  return value == STARTUP_WEB_CONFIG ? STARTUP_WEB_CONFIG
+       : value == STARTUP_WIFI_AP ? STARTUP_WIFI_AP
+       : STARTUP_NORMAL;
+}
+
+void eepromWriteStartupAction(StartupAction action) {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.write(EEPROM_STARTUP_ACTION_ADDR, action);
+  EEPROM.commit();
+  EEPROM.end();
 }
 
 // ------------------------------------------------------------
@@ -882,6 +906,151 @@ void startConfigPortal() {
   delay(1000);
 }
 
+void animateMenuDisplay() {
+  if (P.displayAnimate() && textScrolls) P.displayReset();
+  yield();
+}
+
+void waitForDownloadButtonRelease() {
+  while (digitalRead(PIN_DOWNLOAD) == LOW) {
+    animateMenuDisplay();
+  }
+  delay(40);  // debounce the release before accepting a menu press
+}
+
+void factoryReset() {
+  Serial.println("[Setup] Factory reset requested");
+  showBootMessage("RESET");
+
+  wifiManager.resetSettings();
+
+  EEPROM.begin(EEPROM_SIZE);
+  for (uint16_t address = 0; address < EEPROM_SIZE; address++) {
+    EEPROM.write(address, 0);
+  }
+  EEPROM.commit();
+  EEPROM.end();
+
+  delay(750);
+  ESP.restart();
+}
+
+void startWebConfigPortal() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[Setup] No WiFi for web config; opening WiFi AP instead");
+    startConfigPortal();
+    ESP.restart();
+  }
+
+  Serial.println("[Setup] Starting web configuration portal");
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.startWebPortal();
+  showBootMessage(String("WEB ") + WiFi.localIP().toString());
+  waitForDownloadButtonRelease();
+
+  unsigned long pressedAt = 0;
+  while (true) {
+    wifiManager.process();
+    animateMenuDisplay();
+
+    if (digitalRead(PIN_DOWNLOAD) == LOW) {
+      if (pressedAt == 0) pressedAt = millis();
+      if (millis() - pressedAt >= downloadButtonHoldMs) {
+        Serial.println("[Setup] Closing web configuration portal");
+        wifiManager.stopWebPortal();
+        ESP.restart();
+      }
+    } else {
+      pressedAt = 0;
+    }
+  }
+}
+
+void runSetupMenu() {
+  static const char* const menuLabels[] = { "NORMAL", "WEB CFG", "WIFI AP", "RESET" };
+  const uint8_t menuCount = sizeof(menuLabels) / sizeof(menuLabels[0]);
+  uint8_t selected = 0;
+
+  Serial.println("[Setup] Menu: short press = next, hold 2s = select");
+  showBootMessage(menuLabels[selected]);
+  waitForDownloadButtonRelease();
+
+  unsigned long pressedAt = 0;
+  bool wasPressed = false;
+
+  while (true) {
+    animateMenuDisplay();
+    bool pressed = digitalRead(PIN_DOWNLOAD) == LOW;
+
+    if (pressed && !wasPressed) {
+      pressedAt = millis();
+    } else if (!pressed && wasPressed) {
+      if (millis() - pressedAt < downloadButtonHoldMs) {
+        selected = (selected + 1) % menuCount;
+        showBootMessage(menuLabels[selected]);
+        Serial.printf("[Setup] Selected %s\n", menuLabels[selected]);
+      }
+      pressedAt = 0;
+    }
+
+    if (pressed && pressedAt != 0 && millis() - pressedAt >= downloadButtonHoldMs) {
+      Serial.printf("[Setup] Selected %s\n", menuLabels[selected]);
+      waitForDownloadButtonRelease();
+      wasPressed = false;
+      pressedAt = 0;
+
+      switch (selected) {
+        case 0:  // Normal boot
+          return;
+
+        case 1:  // Web config on the current WiFi network
+          eepromWriteStartupAction(STARTUP_WEB_CONFIG);
+          ESP.restart();
+          break;
+
+        case 2:  // WiFi AP configuration portal
+          eepromWriteStartupAction(STARTUP_WIFI_AP);
+          ESP.restart();
+          break;
+
+        case 3: {  // Factory reset requires a second explicit confirmation
+          bool confirm = false;
+          showBootMessage("NO RESET");
+          Serial.println("[Setup] Factory reset: short press toggles NO/YES, hold 2s confirms");
+
+          while (true) {
+            animateMenuDisplay();
+            bool confirmPressed = digitalRead(PIN_DOWNLOAD) == LOW;
+
+            if (confirmPressed && !wasPressed) {
+              pressedAt = millis();
+            } else if (!confirmPressed && wasPressed) {
+              if (millis() - pressedAt < downloadButtonHoldMs) {
+                confirm = !confirm;
+                showBootMessage(confirm ? "YES RESET" : "NO RESET");
+              }
+              pressedAt = 0;
+            }
+
+            if (confirmPressed && pressedAt != 0 && millis() - pressedAt >= downloadButtonHoldMs) {
+              waitForDownloadButtonRelease();
+              if (confirm) factoryReset();
+
+              showBootMessage(menuLabels[selected]);
+              break;
+            }
+
+            wasPressed = confirmPressed;
+          }
+          break;
+        }
+      }
+    }
+
+    wasPressed = pressed;
+  }
+}
+
 void handleDownloadButton(unsigned long now) {
   if (downloadButtonHandled) return;
 
@@ -893,15 +1062,12 @@ void handleDownloadButton(unsigned long now) {
 
     if (now - downloadButtonPressedAt >= downloadButtonHoldMs) {
       downloadButtonHandled = true;
-      Serial.println("[Button] DOWNLOAD held for 2 seconds; opening config portal");
+      Serial.println("[Button] DOWNLOAD held for 2 seconds; opening setup menu");
 
       if (client.connected()) client.stop();
-      startConfigPortal();
-
-      // WiFiManager may have changed WiFi credentials or the Companion host.
-      // Restart so the REST server, mDNS responder, and TCP client all start
-      // from a known-good state with the saved settings.
-      ESP.restart();
+      runSetupMenu();
+      downloadButtonHandled = false;
+      downloadButtonPressedAt = 0;
     }
   } else {
     downloadButtonPressedAt = 0;
@@ -1350,6 +1516,16 @@ void setup() {
   // Ensure bars are off at boot
   updateBackgroundBars(false, false);
 
+  StartupAction startupAction = eepromReadStartupAction();
+  eepromWriteStartupAction(STARTUP_NORMAL);  // consume one-time menu action
+
+  if (startupAction == STARTUP_WIFI_AP) {
+    Serial.println("[Setup] Opening WiFi AP from setup menu");
+    eepromWriteBootCounter(0);
+    startConfigPortal();
+    ESP.restart();
+  }
+
   // --------------------------------------------------------
   // Simplified boot counter logic:
   //  - 0 → Hello! → write 1
@@ -1359,14 +1535,13 @@ void setup() {
   bootCountCached = eepromReadBootCounter();
   Serial.printf("[Boot] Boot counter read: %u\n", bootCountCached);
   
-  if (bootCountCached == 1) {
+  if (bootCountCached == 1 && startupAction != STARTUP_WEB_CONFIG) {
     // Boot counter 1 → trigger config portal
     Serial.println("[Boot] Boot counter 1 → triggering config portal");
     eepromWriteBootCounter(0);  // Reset immediately
     bootCountCached = 0;
     startConfigPortal();
-    // startConfigPortal() will handle CFG ! display
-    return;  // Skip Hello! logic
+    ESP.restart();
   } else {
     // Boot counter 0 (or any other value) → normal boot with Hello!
     Serial.println("[Boot] Boot counter 0 → normal boot with Hello!");
@@ -1395,13 +1570,17 @@ void setup() {
   bootCountCached = 0;
   Serial.println("[Boot] Hello! timeout - boot counter reset to 0");
 
-  // WiFi + config (with boot counter logic via bootCountCached)
+  // WiFi + config
   connectToNetwork();
 
   // The REST API must be ready before we advertise the service: Companion's
   // auto-setup immediately POSTs the selected device's Companion host/port.
   setupRestAPI();
   setupMDNS();
+
+  if (startupAction == STARTUP_WEB_CONFIG) {
+    startWebConfigPortal();
+  }
 
   Serial.println("[System] Setup complete, entering loop");
 }
