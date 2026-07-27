@@ -89,16 +89,8 @@ The device boots and attempts Wi-Fi and Companion automatically.
 - - Wi-Fi SSID & Password
 - - Companion IP
 - - Companion Port
-- - Boot Counter info
 - Stores Companion info in EEPROM
 - - Automatically reconnects to both Wi-Fi and Companion
-
-## Automatic Boot-Recovery
-
-- During boot, device displays CONFIG? for 5 seconds
-- If you reset the device during this window → next boot forces config mode
-- Boot counter stored in EEPROM ensures this works reliably
-- You will NOT go into config mode just because Companion is offline (device keeps retrying forever)
 
 ## Entering Config Portal
 
@@ -111,10 +103,9 @@ After a normal boot, hold the **DOWNLOAD** button for two seconds to open the se
 
 Do **not** hold DOWNLOAD while pressing RESET: it is connected to GPIO0 and will put the ESP8266 into the serial flashing bootloader instead of running the firmware.
 
-The original reset-count fallback remains available: reset the device while `CONFIG?` is scrolling, then it will enter WiFi Manager config mode on the next boot and display `CFG !`.
 - Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
 - It should take you to 192.168.4.1 (if not, go there)
-- Setup the Companion IP, Companion Port, set the mode you want, and set Boot to 0
+- Setup the Companion IP, Companion Port, and the display mode you want
 - Modes Are:
 - - none    – ignore COLOR, no invert, no bars
 - - invert  – invert the whole display when any color channel ≥ 128

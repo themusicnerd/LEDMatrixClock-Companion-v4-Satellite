@@ -22,8 +22,7 @@
   Config behaviour:
     - WiFi fails => WiFiManager config portal (standard)
     - Companion down => keep retrying, NO config portal
-    - Reset during 5s "CONFIG?" window =>
-      next boot triggers config portal via boot counter
+    - Hold DOWNLOAD for 2 seconds after boot => setup menu
 
   Background handling modes (configurable via WiFiManager):
     - none    : ignore COLOR, no invert, no bars
@@ -152,9 +151,7 @@ const char* AP_password = "";
 // [43..48] = companion_port (6 bytes)
 // [50..65] = bg_mode_str (16 bytes)
 // [66]     = brightness (0-100)
-// [60]     = bootCounter
 const uint16_t EEPROM_SIZE      = 128;
-const uint16_t EEPROM_BOOT_ADDR = 60;
 const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
 
 enum StartupAction : uint8_t {
@@ -186,21 +183,6 @@ unsigned long connectionStartTime = 0;
 bool connectingMessageShown = false;
 const unsigned long connectingMessageDelay = 1000; // 1 second
 bool connectionEstablished = false; // Track when connection is fully established
-
-// How many previous boots before forcing config portal
-const uint8_t BOOT_FAIL_LIMIT = 1;
-
-// Config state tracking
-enum ConfigState {
-  CFG_NORMAL = 0,
-  CFG_REQUESTED = 1,
-  CFG_ACTIVE = 2
-};
-
-ConfigState configState = CFG_NORMAL;
-
-// Cached copy of PRE-INCREMENT boot counter (from EEPROM)
-uint8_t bootCountCached = 0;
 
 // Brightness (0–100 from Companion)
 int brightness = 1;
@@ -322,22 +304,6 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
 
   EEPROM.commit();
   EEPROM.end();
-}
-
-uint8_t eepromReadBootCounter() {
-  EEPROM.begin(EEPROM_SIZE);
-  uint8_t c = EEPROM.read(EEPROM_BOOT_ADDR);
-  EEPROM.end();
-  Serial.printf("[EEPROM] Read boot counter: %u\n", c);
-  return c;
-}
-
-void eepromWriteBootCounter(uint8_t c) {
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.write(EEPROM_BOOT_ADDR, c);
-  bool commitResult = EEPROM.commit();
-  EEPROM.end();
-  Serial.printf("[EEPROM] Write boot counter: %u, commit result: %s\n", c, commitResult ? "SUCCESS" : "FAILED");
 }
 
 StartupAction eepromReadStartupAction() {
@@ -493,7 +459,6 @@ String getParam(const String& name) {
 void saveParamCallback() {
   String str_companionIP   = getParam("companionIP");
   String str_companionPort = getParam("companionPort");
-  String str_bootCount     = getParam("bootCount");
   String str_bgMode        = getParam("bgmode");
 
   if (str_companionIP.length() > 0) {
@@ -513,10 +478,7 @@ void saveParamCallback() {
   applyBackgroundFromLastColor();
 
   eepromSaveCompanionConfig(companion_host, companion_port);
-  
-  // Reset boot counter to 0 to ensure we exit config mode if WiFiManager reboots
-  eepromWriteBootCounter(0);
-  Serial.println("[WiFi] Settings saved - boot counter reset to 0 for normal boot");
+  Serial.println("[WiFi] Settings saved");
 }
 
 // ------------------------------------------------------------
@@ -843,7 +805,6 @@ void showConfigModeMessage() {
 
 void startConfigPortal() {
   Serial.println("[WiFi] Entering CONFIG PORTAL mode");
-  configState = CFG_ACTIVE;
   
   // Load Companion config from EEPROM (for default field values)
   eepromLoadCompanionConfig();
@@ -901,10 +862,6 @@ void startConfigPortal() {
   applyBackgroundFromLastColor();
 
   eepromSaveCompanionConfig(companion_host, companion_port);
-
-  // Reset boot counter so we do not immediately re-enter config
-  eepromWriteBootCounter(0);
-  configState = CFG_NORMAL;
 
   // Show a small message so you know it applied
   showBootMessage("CFG SAVED");
@@ -1093,8 +1050,6 @@ void connectToNetwork() {
   bgMode = parseBgMode(bg_mode_str);
   applyBackgroundFromLastColor();
 
-  Serial.printf("[Boot] Cached boot counter (prev boot) = %u\n", bootCountCached);
-
   // ---------- Prepare WiFiManager with params BEFORE any portal ----------
 
   // Companion IP / Port params
@@ -1164,9 +1119,6 @@ void connectToNetwork() {
 
   eepromSaveCompanionConfig(companion_host, companion_port);
 
-  // WiFi successfully connected => clear boot counter
-  eepromWriteBootCounter(0);
-  Serial.println("[Boot] Boot counter reset to 0 (WiFi !)");
 }
 
 // ------------------------------------------------------------
@@ -1633,31 +1585,8 @@ void setup() {
 
   if (startupAction == STARTUP_WIFI_AP) {
     Serial.println("[Setup] Opening WiFi AP from setup menu");
-    eepromWriteBootCounter(0);
     startConfigPortal();
     ESP.restart();
-  }
-
-  // --------------------------------------------------------
-  // Simplified boot counter logic:
-  //  - 0 → Hello! → write 1
-  //  - 1 → CFG ! → write 0
-  //  - Hello! timeout → write 0
-  // --------------------------------------------------------
-  bootCountCached = eepromReadBootCounter();
-  Serial.printf("[Boot] Boot counter read: %u\n", bootCountCached);
-  
-  if (bootCountCached == 1 && startupAction != STARTUP_WEB_CONFIG) {
-    // Boot counter 1 → trigger config portal
-    Serial.println("[Boot] Boot counter 1 → triggering config portal");
-    eepromWriteBootCounter(0);  // Reset immediately
-    bootCountCached = 0;
-    startConfigPortal();
-    ESP.restart();
-  } else {
-    // Boot counter 0 (or any other value) → normal boot with Hello!
-    Serial.println("[Boot] Boot counter 0 → normal boot with Hello!");
-    eepromWriteBootCounter(1);  // Set to 1 for next boot trigger
   }
 
   // Show "Hello!" for 3 seconds
@@ -1677,11 +1606,6 @@ void setup() {
   P.displayClear();
   currentText = "";
   
-  // Hello! timeout → reset boot counter to 0
-  eepromWriteBootCounter(0);
-  bootCountCached = 0;
-  Serial.println("[Boot] Hello! timeout - boot counter reset to 0");
-
   // WiFi + config
   connectToNetwork();
 
