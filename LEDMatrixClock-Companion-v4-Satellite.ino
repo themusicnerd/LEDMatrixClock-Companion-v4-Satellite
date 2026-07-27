@@ -1188,6 +1188,63 @@ void handleGetConfig() {
   Serial.println("[REST] GET /api/config: " + json);
 }
 
+String jsonSetting(const String& body, const char* name) {
+  const String key = String("\"") + name + "\"";
+  int pos = body.indexOf(key); if (pos < 0) return "";
+  pos = body.indexOf(':', pos + key.length()); if (pos < 0) return "";
+  pos++; while (pos < body.length() && isspace(body[pos])) pos++;
+  if (pos < body.length() && body[pos] == '\"') { const int end = body.indexOf('\"', ++pos); return end < 0 ? "" : body.substring(pos, end); }
+  int end = pos; while (end < body.length() && body[end] != ',' && body[end] != '}') end++;
+  String value = body.substring(pos, end); value.trim(); return value;
+}
+
+void handleGetSettings() {
+  const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"brightness\":" + String(brightness) + "}";
+  restServer.send(200, "application/json", json);
+}
+
+void handlePostSettings() {
+  const String body = restServer.arg("plain");
+  const String mode = jsonSetting(body, "mode"), brightnessValue = jsonSetting(body, "brightness");
+  if (mode.length() && !(mode == "none" || mode == "invert" || mode == "bars" || mode == "pgmpvw" || mode == "pvwpgm")) { restServer.send(400, "text/plain", "Invalid mode"); return; }
+  if (brightnessValue.length() && (brightnessValue.toInt() < 0 || brightnessValue.toInt() > 100)) { restServer.send(400, "text/plain", "Invalid brightness"); return; }
+  if (mode.length()) { mode.toCharArray(bg_mode_str, sizeof(bg_mode_str)); bgMode = parseBgMode(bg_mode_str); applyBackgroundFromLastColor(); }
+  if (brightnessValue.length()) { brightness = brightnessValue.toInt(); setMatrixBrightnessFromPercent(brightness); }
+  eepromSaveCompanionConfig(companion_host, companion_port);
+  restServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+String statusJsonEscape(String value) {
+  value.replace("\\", "\\\\"); value.replace("\"", "\\\"");
+  value.replace("\n", "\\n"); value.replace("\r", "\\r");
+  return value;
+}
+
+void handleStatus() {
+  String json = "{\"deviceName\":\"LED Matrix Clock\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
+  json += "\"network\":\"wifi\",\"networkConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"ssid\":\"" + statusJsonEscape(WiFi.SSID()) + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"companionConnected\":" + String(client.connected() ? "true" : "false") + ",";
+  json += "\"companion\":\"" + statusJsonEscape(String(companion_host) + ":" + companion_port) + "\",";
+  json += "\"text\":\"" + statusJsonEscape(currentText) + "\",\"mode\":\"" + String(bg_mode_str) +
+    "\",\"brightness\":" + String(brightness) + ",";
+  json += "\"color\":{\"valid\":" + String(lastColorValid ? "true" : "false") + ",\"r\":" +
+    String(lastColorR) + ",\"g\":" + String(lastColorG) + ",\"b\":" + String(lastColorB) + "},";
+  json += "\"uptimeSeconds\":" + String(millis() / 1000) + "}";
+  restServer.send(200, "application/json", json);
+}
+
+void handleDashboard() {
+  restServer.send(200, "text/html",
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>LED Matrix Clock</title>"
+    "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
+    "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "s.textContent=(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip;"
+    "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
+    "j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
+}
+
 void handlePostHost() {
   String newHost = "";
   
@@ -1443,13 +1500,17 @@ void handleFirmwareUpdatePassword() {
 
 void setupRestAPI() {
   // Register endpoints
+  restServer.on("/", HTTP_GET, handleDashboard);
   restServer.on("/api/host", HTTP_GET, handleGetHost);
   restServer.on("/api/port", HTTP_GET, handleGetPort);
   restServer.on("/api/config", HTTP_GET, handleGetConfig);
+  restServer.on("/api/settings", HTTP_GET, handleGetSettings);
+  restServer.on("/api/status", HTTP_GET, handleStatus);
   
   restServer.on("/api/host", HTTP_POST, handlePostHost);
   restServer.on("/api/port", HTTP_POST, handlePostPort);
   restServer.on("/api/config", HTTP_POST, handlePostConfig);
+  restServer.on("/api/settings", HTTP_POST, handlePostSettings);
   restServer.on("/update", HTTP_GET, handleFirmwareUpdatePage);
   restServer.on("/update", HTTP_POST, handleFirmwareUpdateResult, handleFirmwareUpload);
   restServer.on("/update/password", HTTP_POST, handleFirmwareUpdatePassword);

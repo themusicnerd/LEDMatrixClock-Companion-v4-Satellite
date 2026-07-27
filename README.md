@@ -176,6 +176,11 @@ which means it can be driven by: Variables & Custom Actions!
 
 Upload only the release application `.bin`; serial flash images and files made for a different flash layout are not suitable for browser updates.
 
+Browse to `http://<device-ip>:9999/` for the live troubleshooting dashboard.
+It shows the device name and ID, Wi-Fi and Companion connection status, IP
+address, matrix mode, brightness, latest incoming text and RGB colour, and
+uptime. The dashboard refreshes every two seconds.
+
 ## Companion discovery and setup menu
 
 The satellite advertises `companion-satellite._tcp` with AtomS3-compatible metadata, so Companion can discover and configure it automatically. Hold **DOWNLOAD** for two seconds after boot to open the setup menu; choose normal boot, Web Config, Wi-Fi AP, or Factory Reset. The display modes are `none`, `invert`, `bars`, `pgmpvw`, and `pvwpgm`.
