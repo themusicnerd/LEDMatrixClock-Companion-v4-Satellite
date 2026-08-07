@@ -178,6 +178,7 @@ which means it can be driven by: Variables & Custom Actions!
 - Text ≤5 chars → centred static
 - Long text → smooth scroll from right to left
 - Numeric `NN:NN:NN` text uses a compact 3×7 static font that fits the 32×8 matrix
+- Scrolling text moves right-to-left in every orientation
 - Updates do not flicker
 - BRIGHTNESS 0–100 maps to matrix intensity 0–15
 - “Waiting…” appears until Companion connects
@@ -202,9 +203,9 @@ higher values scroll slower. The supported range is `10–250 ms`.
 The orientation choices are:
 
 - `0°` — normal display orientation.
-- `180°` — flip the matrix horizontally and vertically.
-- `90° CW` — normal mirroring (no additional flip).
-- `90° CCW` — flip horizontally.
+- `180°` — rotate the normal display to its opposite mounting orientation.
+- `90° CW` — mirrored orientation.
+- `90° CCW` — flipped and mirrored orientation.
 
 Orientation and scroll speed are saved in EEPROM and restored after reboot.
 

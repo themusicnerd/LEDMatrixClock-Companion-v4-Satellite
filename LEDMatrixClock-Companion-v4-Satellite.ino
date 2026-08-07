@@ -44,6 +44,8 @@
 #include <EEPROM.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
+
+const char* FIRMWARE_VERSION = "1.4.2";
 #include <SPI.h>
 #include <vector>
 #include <ESP8266mDNS.h>
@@ -430,11 +432,13 @@ void applyDisplayOrientation() {
   P.setZoneEffect(0, false, PA_FLIP_LR);
   P.setZoneEffect(0, false, PA_FLIP_UD);
 
-  if (displayOrientation == ORIENTATION_180) {
+  if (displayOrientation == ORIENTATION_0) {
     P.setZoneEffect(0, true, PA_FLIP_LR);
+  } else if (displayOrientation == ORIENTATION_180) {
     P.setZoneEffect(0, true, PA_FLIP_UD);
   } else if (displayOrientation == ORIENTATION_90_CCW) {
     P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
   }
 
   Serial.printf("[DISPLAY] Orientation=%s flipLR=%s flipUD=%s\n",
@@ -676,15 +680,20 @@ void applyTextToParola() {
     P.setTextAlignment(PA_CENTER);
     P.print(matrixText);
   } else {
-    // Scrolling text (right-to-left on your flipped modules)
+    // Keep the physical motion right-to-left. PA_FLIP_LR reverses Parola's
+    // logical animation direction, so mirrored orientations need the opposite
+    // effect from non-mirrored orientations.
     textScrolls = true;
+    const bool horizontallyFlipped = displayOrientation == ORIENTATION_0 ||
+      displayOrientation == ORIENTATION_90_CCW;
+    const textEffect_t scrollEffect = horizontallyFlipped ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
     P.displayText(
       matrixText,
       PA_LEFT,
       scrollDelayMs,
       scrollPause,
-      PA_SCROLL_RIGHT,   // entry
-      PA_SCROLL_RIGHT    // exit
+      scrollEffect,
+      scrollEffect
     );
     P.displayReset();
   }
@@ -1289,7 +1298,8 @@ String statusJsonEscape(String value) {
 }
 
 void handleStatus() {
-  String json = "{\"deviceName\":\"LED Matrix Clock\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
+  String json = "{\"deviceName\":\"LED Matrix Clock\",\"firmwareVersion\":\"" +
+    String(FIRMWARE_VERSION) + "\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
   json += "\"network\":\"wifi\",\"networkConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   json += "\"ssid\":\"" + statusJsonEscape(WiFi.SSID()) + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"companionConnected\":" + String(client.connected() ? "true" : "false") + ",";
@@ -1310,11 +1320,11 @@ void handleDashboard() {
     "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
     "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
     "<h3>Display settings</h3><label>Background mode <select id=bm><option value=none>None</option><option value=invert>Invert</option><option value=bars>Bars</option><option value=pgmpvw>PGM left / PVW right</option><option value=pvwpgm>PVW left / PGM right</option></select></label><br>"
-    "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror normal</option><option value=90ccw>90 CCW - mirror horizontal</option></select></label><br>"
+    "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror</option><option value=90ccw>90 CCW - flip / mirror</option></select></label><br>"
     "<label>Brightness <input id=br type=number min=0 max=100></label><br>"
     "<label>Scroll step delay <input id=sd type=number min=10 max=250> ms <small>(lower is faster; default 40)</small></label> <button onclick=v()>Save display settings</button><div id=o></div>"
     "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
-    "s.textContent=(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
+    "s.textContent='Firmware v'+x.firmwareVersion+' | '+(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
     "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
     "if(!loaded){bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
@@ -1637,6 +1647,7 @@ void setupMDNS() {
   MDNS.addServiceTxt("companion-satellite", "tcp", "prefix", "led-matrix");
   MDNS.addServiceTxt("companion-satellite", "tcp", "productName", "LED Matrix");
   MDNS.addServiceTxt("companion-satellite", "tcp", "apiVersion", "4");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "firmwareVersion", FIRMWARE_VERSION);
 
   mdnsStarted = true;
   Serial.printf("[mDNS] Advertising %s on port 9999\n", mDNSInstanceName.c_str());
