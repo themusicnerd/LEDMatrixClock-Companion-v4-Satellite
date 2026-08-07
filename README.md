@@ -179,6 +179,7 @@ which means it can be driven by: Variables & Custom Actions!
 - Long text → smooth scroll from right to left
 - Numeric `NN:NN:NN` text uses a compact 3×7 static font that fits the 32×8 matrix
 - Scrolling text moves right-to-left in every orientation
+- PGM/PVW edge bars remain stable during static text changes and scrolling
 - Updates do not flicker
 - BRIGHTNESS 0–100 maps to matrix intensity 0–15
 - “Waiting…” appears until Companion connects
@@ -199,6 +200,10 @@ uptime. The dashboard refreshes every two seconds. Its **Display settings** form
 also lets you view and change the background mode, orientation, brightness, and
 scroll step delay. The default delay is `40 ms`; lower values scroll faster and
 higher values scroll slower. The supported range is `10–250 ms`.
+
+The **Companion settings** form shows the saved Companion IP address or hostname
+and Satellite port. Saving it writes the new values to EEPROM and immediately
+reconnects the device to Companion.
 
 The orientation choices are:
 

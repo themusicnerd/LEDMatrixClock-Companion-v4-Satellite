@@ -45,7 +45,7 @@
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 
-const char* FIRMWARE_VERSION = "1.4.2";
+const char* FIRMWARE_VERSION = "1.4.3";
 #include <SPI.h>
 #include <vector>
 #include <ESP8266mDNS.h>
@@ -470,6 +470,17 @@ void updateBackgroundBars(bool leftOn, bool rightOn) {
   mx->setColumn(c1, rightOn ? colOn : colOff);
 }
 
+bool barsNeedOverlay() {
+  return client.connected() &&
+    (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM);
+}
+
+void finishAtomicMatrixRender(bool atomicRender, bool preserveBars) {
+  if (!atomicRender || !mx) return;
+  if (preserveBars) updateBackgroundBars(barLeftOn, barRightOn);
+  mx->update(MD_MAX72XX::ON);
+}
+
 // Apply background/invert/bars for a given color and current bgMode
 void applyBackgroundFromColor(int r, int g, int b) {
   bool anyBright   = (r >= 128) || (g >= 128) || (b >= 128);
@@ -519,7 +530,14 @@ void applyBackgroundFromColor(int r, int g, int b) {
       break;
   }
 
-  updateBackgroundBars(left, right);
+  if (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM) {
+    updateBackgroundBars(left, right);
+  } else {
+    // In none/invert modes the edge columns belong to the text/background.
+    // Do not blank them ahead of the next atomic text frame.
+    barLeftOn = false;
+    barRightOn = false;
+  }
 
   Serial.printf(
     "[BG] Mode=%d  R=%d G=%d B=%d  invert=%s  left=%s right=%s\n",
@@ -609,10 +627,17 @@ bool isCompactClockText(const String& txt) {
 
 void applyTextToParola() {
   String txt = currentText;
+  const bool atomicRender = mx != nullptr;
+  const bool preserveBars = barsNeedOverlay() && mx;
+
+  // Prevent clear/invert/text/bar operations from reaching the LEDs separately.
+  // The complete static frame or scrolling setup is flushed in one update.
+  if (atomicRender) mx->update(MD_MAX72XX::OFF);
 
   if (txt.length() == 0) {
     P.displayClear();
     textScrolls = false;
+    finishAtomicMatrixRender(atomicRender, preserveBars);
     return;
   }
 
@@ -698,10 +723,7 @@ void applyTextToParola() {
     P.displayReset();
   }
 
-  // Reapply bars on top of whatever we just drew (modes that use bars) - only when Companion is connected
-  if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
-    updateBackgroundBars(barLeftOn, barRightOn);
-  }
+  finishAtomicMatrixRender(atomicRender, preserveBars);
 }
 
 void setTextNow(const String& txt) {
@@ -1287,7 +1309,7 @@ void handlePostSettings() {
   if (brightnessValue.length()) { brightness = brightnessValue.toInt(); setMatrixBrightnessFromPercent(brightness); }
   if (scrollDelayValue.length()) scrollDelayMs = scrollDelayValue.toInt();
   eepromSaveCompanionConfig(companion_host, companion_port);
-  if (orientation.length() || scrollDelayValue.length()) applyTextToParola();
+  if (mode.length() || orientation.length() || scrollDelayValue.length()) applyTextToParola();
   restServer.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1319,14 +1341,16 @@ void handleDashboard() {
     "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>LED Matrix Clock</title>"
     "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
     "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
+    "<h3>Companion settings</h3><label>Companion IP / hostname <input id=ch maxlength=39></label><br>"
+    "<label>Satellite port <input id=cp type=number min=1 max=65535></label> <button onclick=cg()>Save and reconnect</button><div id=co></div>"
     "<h3>Display settings</h3><label>Background mode <select id=bm><option value=none>None</option><option value=invert>Invert</option><option value=bars>Bars</option><option value=pgmpvw>PGM left / PVW right</option><option value=pvwpgm>PVW left / PGM right</option></select></label><br>"
     "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror</option><option value=90ccw>90 CCW - flip / mirror</option></select></label><br>"
     "<label>Brightness <input id=br type=number min=0 max=100></label><br>"
     "<label>Scroll step delay <input id=sd type=number min=10 max=250> ms <small>(lower is faster; default 40)</small></label> <button onclick=v()>Save display settings</button><div id=o></div>"
-    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function cg(){let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ch.value.trim(),port:+cp.value})});co.textContent=await r.text();loaded=false}async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
     "s.textContent='Firmware v'+x.firmwareVersion+' | '+(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
     "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
-    "if(!loaded){bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
+    "if(!loaded){let g=await(await fetch('/api/config')).json();ch.value=g.host;cp.value=g.port;bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
 
 void handlePostHost() {
@@ -1910,17 +1934,11 @@ void loop() {
     setTextNow(pendingText);
   }
 
-  // Let Parola do its thing
-  if (P.displayAnimate()) {
-    // Only auto-reset for scrolling animations.
-    // For static text (PRINT), leave it alone so it doesn’t flash.
-    if (textScrolls) {
-      P.displayReset();
-    }
-
-    // Re-apply bars each animation step in bar modes - only when Companion is connected
-    if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
-      updateBackgroundBars(barLeftOn, barRightOn);
-    }
+  // Static PRINT output is already complete, so do not ask Parola to repaint it.
+  // Scrolling remains under Parola's normal update path; the edge bars are
+  // restored after each completed animation step.
+  if (textScrolls && P.displayAnimate()) {
+    P.displayReset();
+    if (barsNeedOverlay()) updateBackgroundBars(barLeftOn, barRightOn);
   }
 }
