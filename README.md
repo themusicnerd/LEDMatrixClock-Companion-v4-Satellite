@@ -16,6 +16,8 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
   - `pgmpvw` – left bars = PGM (red ≥ 128), right bars = PVW (green ≥ 128)
   - `pvwpgm` – left bars = PVW (green ≥ 128), right bars = PGM (red ≥ 128)
 - ✅ **Brightness** control via Companion BRIGHTNESS (0–100 → 0–15 LED intensity)
+- ✅ Static compact rendering for numeric `HH:MM:SS` / `NN:NN:NN` text
+- ✅ Selectable display orientation: `180`, `90 CW`, or `90 CCW`
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
 - ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
@@ -28,6 +30,8 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
 ## Static text
 - Text ≤ 5 characters → centered
 - Text width ≤ 32 px → centered
+- Eight-character numeric clock text such as `23:59:59` uses a compact font and
+  stays centered instead of scrolling
 
 ## Scrolling text
 - Text wider than 32 columns → smooth right-to-left scroll
@@ -103,6 +107,15 @@ After a normal boot, hold the **DOWNLOAD** button for two seconds to open the se
 
 Do **not** hold DOWNLOAD while pressing RESET: it is connected to GPIO0 and will put the ESP8266 into the serial flashing bootloader instead of running the firmware.
 
+### Reset the Wi-Fi settings
+
+Open the setup menu with a two-second DOWNLOAD hold, short-press to `RESET`, and
+hold for two seconds. On the confirmation screen, short-press to select
+`YES RESET`, then hold for two seconds again. This erases the saved Wi-Fi,
+Companion, and display settings and restarts the clock. Select `WIFI AP` instead
+when you only want to replace the Wi-Fi credentials without erasing the other
+settings.
+
 - Connect to LED-MATRIX-XXXXXXXXXXX (with the mac address at the end)
 - It should take you to 192.168.4.1 (if not, go there)
 - Setup the Companion IP, Companion Port, and the display mode you want
@@ -136,9 +149,19 @@ Settings save to EEPROM.
 ## Companion Setup
 
 In Companion v4:
-- It should automatically show up as Satellite Surface
+- Open **Surfaces > Remote Surfaces**; it should appear as a discovered
+  Companion Satellite.
+- Select **+ Setup**, choose the address Companion should advertise, and confirm.
 - Assign the button offset in Surfaces
-- Select the discovered device and let Companion configure its own host/port through the satellite REST API. Manual Companion IP/port configuration remains available as a fallback.
+- Companion configures its own host and Satellite TCP port `16622` through the
+  device REST API on port `9999`. Manual configuration remains available as a
+  fallback.
+
+The enable/disable switch used by devices such as Stream Deck Network Dock is
+provided by their Companion surface-integration module and does not apply to
+Satellite API connections. **+ Setup** is the expected claiming flow for this
+firmware. mDNS discovery requires a shared broadcast domain or an mDNS reflector
+between VLANs.
 
 ## The device appears as:
 
@@ -154,6 +177,7 @@ which means it can be driven by: Variables & Custom Actions!
 ## Display Behaviour
 - Text ≤5 chars → centred static
 - Long text → smooth scroll from right to left
+- Numeric `NN:NN:NN` text uses a compact 3×7 static font that fits the 32×8 matrix
 - Updates do not flicker
 - BRIGHTNESS 0–100 maps to matrix intensity 0–15
 - “Waiting…” appears until Companion connects
@@ -170,7 +194,16 @@ Upload only the release application `.bin`; serial flash images and files made f
 Browse to `http://<device-ip>:9999/` for the live troubleshooting dashboard.
 It shows the device name and ID, Wi-Fi and Companion connection status, IP
 address, matrix mode, brightness, latest incoming text and RGB colour, and
-uptime. The dashboard refreshes every two seconds.
+uptime. The dashboard refreshes every two seconds. Its **Display settings** form
+also lets you view and change the background mode, orientation, and brightness.
+
+The orientation choices are:
+
+- `180°` — flip the matrix horizontally and vertically.
+- `90° CW` — normal mirroring (no additional flip).
+- `90° CCW` — flip horizontally.
+
+Orientation is saved in EEPROM and restored after reboot.
 
 ## Companion discovery and setup menu
 

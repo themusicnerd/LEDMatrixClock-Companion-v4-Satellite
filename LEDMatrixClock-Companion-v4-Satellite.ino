@@ -72,6 +72,23 @@ MD_Parola P = MD_Parola(HARDWARE_TYPE, PIN_CS, MAX_DEVICES);
 // Underlying MAX72xx object for direct column control (bars)
 MD_MAX72XX* mx = nullptr;
 
+// Compact 3x7 numeric font for fixed NN:NN:NN displays. Six 3-column digits,
+// two 1-column colons and seven 1-column spaces use 27 of the 32 columns.
+MD_MAX72XX::fontType_t compactClockFont[] PROGMEM = {
+  'F', 1, '0', ':', 7,
+  3, 0x7F, 0x41, 0x7F, // 0
+  3, 0x00, 0x7F, 0x00, // 1
+  3, 0x79, 0x49, 0x4F, // 2
+  3, 0x49, 0x49, 0x7F, // 3
+  3, 0x0F, 0x08, 0x7F, // 4
+  3, 0x4F, 0x49, 0x79, // 5
+  3, 0x7F, 0x49, 0x79, // 6
+  3, 0x01, 0x01, 0x7F, // 7
+  3, 0x7F, 0x49, 0x7F, // 8
+  3, 0x4F, 0x49, 0x7F, // 9
+  1, 0x22              // :
+};
+
 // Global text buffer that Parola will use (must stay valid!)
 char matrixText[96];   // adjust size if you want longer max text
 
@@ -99,6 +116,15 @@ BackgroundMode bgMode = BG_INVERT;          // default behaviour
 
 // Stored as text for WiFiManager & EEPROM
 char bg_mode_str[16] = "invert";
+
+enum DisplayOrientation : uint8_t {
+  ORIENTATION_180 = 0,
+  ORIENTATION_90_CW,
+  ORIENTATION_90_CCW
+};
+
+// Preserve the existing hardcoded PA_FLIP_LR behavior on upgrade.
+DisplayOrientation displayOrientation = ORIENTATION_90_CCW;
 
 // Last COLOR received
 int  lastColorR = 0;
@@ -151,8 +177,10 @@ const char* AP_password = "";
 // [43..48] = companion_port (6 bytes)
 // [50..65] = bg_mode_str (16 bytes)
 // [66]     = brightness (0-100)
+// [68]     = display orientation
 const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
+const uint16_t EEPROM_ORIENTATION_ADDR = 68;
 
 enum StartupAction : uint8_t {
   STARTUP_NORMAL = 0,
@@ -238,7 +266,16 @@ extern String firmwareUpdatePassword;
 void eepromLoadCompanionConfig() {
   EEPROM.begin(EEPROM_SIZE);
   char updatePassword[33] = {};
-  for (uint8_t i = 0; i < 32; ++i) updatePassword[i] = EEPROM.read(70 + i);
+  // Fresh/older installations leave this EEPROM region erased (0xFF). Treat
+  // that state as the documented empty password instead of locking OTA behind
+  // an impossible 32-byte password.
+  if (EEPROM.read(70) != 0xFF) {
+    for (uint8_t i = 0; i < 32; ++i) {
+      const uint8_t savedByte = EEPROM.read(70 + i);
+      if (savedByte == 0 || savedByte == 0xFF) break;
+      updatePassword[i] = static_cast<char>(savedByte);
+    }
+  }
   firmwareUpdatePassword = String(updatePassword);
   if (EEPROM.read(0) == 'L' && EEPROM.read(1) == 'M') {
     // Valid header
@@ -264,12 +301,18 @@ void eepromLoadCompanionConfig() {
     if (brightness < 0 || brightness > 100) {
       brightness = 1; // default if invalid
     }
+
+    const uint8_t savedOrientation = EEPROM.read(EEPROM_ORIENTATION_ADDR);
+    displayOrientation = savedOrientation <= ORIENTATION_90_CCW
+      ? static_cast<DisplayOrientation>(savedOrientation)
+      : ORIENTATION_90_CCW;
   } else {
     // No valid data - set defaults
     strcpy(companion_host, "192.168.1.100");
     strcpy(companion_port, "9999");
     strcpy(bg_mode_str, "invert");
     brightness = 1; // default brightness
+    displayOrientation = ORIENTATION_90_CCW;
   }
   EEPROM.end();
 }
@@ -301,6 +344,7 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
 
   // brightness
   EEPROM.write(66, (uint8_t)brightness);
+  EEPROM.write(EEPROM_ORIENTATION_ADDR, static_cast<uint8_t>(displayOrientation));
 
   EEPROM.commit();
   EEPROM.end();
@@ -350,6 +394,40 @@ BackgroundMode parseBgMode(const char* val) {
   if (s == "pvwpgm") return BG_PVWPGM;
 
   return BG_INVERT;
+}
+
+const char* displayOrientationName() {
+  switch (displayOrientation) {
+    case ORIENTATION_180:    return "180";
+    case ORIENTATION_90_CW:  return "90cw";
+    default:                 return "90ccw";
+  }
+}
+
+bool parseDisplayOrientation(const String& value, DisplayOrientation& parsed) {
+  String normalized = value;
+  normalized.toLowerCase();
+  if (normalized == "180")   { parsed = ORIENTATION_180; return true; }
+  if (normalized == "90cw")  { parsed = ORIENTATION_90_CW; return true; }
+  if (normalized == "90ccw") { parsed = ORIENTATION_90_CCW; return true; }
+  return false;
+}
+
+void applyDisplayOrientation() {
+  P.setZoneEffect(0, false, PA_FLIP_LR);
+  P.setZoneEffect(0, false, PA_FLIP_UD);
+
+  if (displayOrientation == ORIENTATION_180) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  } else if (displayOrientation == ORIENTATION_90_CCW) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+  }
+
+  Serial.printf("[DISPLAY] Orientation=%s flipLR=%s flipUD=%s\n",
+    displayOrientationName(),
+    P.getZoneEffect(0, PA_FLIP_LR) ? "true" : "false",
+    P.getZoneEffect(0, PA_FLIP_UD) ? "true" : "false");
 }
 
 // Draw/update edge bars based on booleans
@@ -503,6 +581,15 @@ void showBootMessage(const String& msg) {
 
 // Decide whether we can center text or need to scroll
 // Very approximate: assume ~6px per char on default font.
+bool isCompactClockText(const String& txt) {
+  if (txt.length() != 8 || txt[2] != ':' || txt[5] != ':') return false;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i == 2 || i == 5) continue;
+    if (txt[i] < '0' || txt[i] > '9') return false;
+  }
+  return true;
+}
+
 void applyTextToParola() {
   String txt = currentText;
 
@@ -511,6 +598,8 @@ void applyTextToParola() {
     textScrolls = false;
     return;
   }
+
+  const bool compactClock = isCompactClockText(txt);
 
   // lowercase detection left in, if you want to change font later
   bool hasLower = false;
@@ -522,8 +611,8 @@ void applyTextToParola() {
   }
   useBigFont = !hasLower;
 
-  // Use default internal font
-  P.setFont(nullptr);
+  P.setFont(compactClock ? compactClockFont : nullptr);
+  P.setCharSpacing(1);
 
   // Apply invert state (for BG_INVERT only)
   P.setInvert(invertDisplay);
@@ -540,7 +629,7 @@ void applyTextToParola() {
 
   uint16_t maxCols    = MAX_DEVICES * 8;
   uint16_t charWidth  = useBigFont ? 8 : 6;
-  uint16_t textWidth  = len * charWidth;
+  uint16_t textWidth  = compactClock ? 27 : len * charWidth;
   bool textFits       = (textWidth <= maxCols);
 
   // Also treat “short” text as fitting even if estimate is wrong
@@ -558,6 +647,11 @@ void applyTextToParola() {
   
   // Specific override: Hello! should always be static
   if (txt == "Hello!") {
+    textFits = true;
+  }
+
+  // Fixed compact clock values always fit and must never scroll.
+  if (compactClock) {
     textFits = true;
   }
 
@@ -1151,18 +1245,24 @@ String jsonSetting(const String& body, const char* name) {
 }
 
 void handleGetSettings() {
-  const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"brightness\":" + String(brightness) + "}";
+  const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"orientation\":\"" +
+    String(displayOrientationName()) + "\",\"brightness\":" + String(brightness) + "}";
   restServer.send(200, "application/json", json);
 }
 
 void handlePostSettings() {
   const String body = restServer.arg("plain");
-  const String mode = jsonSetting(body, "mode"), brightnessValue = jsonSetting(body, "brightness");
+  const String mode = jsonSetting(body, "mode"), orientation = jsonSetting(body, "orientation"),
+    brightnessValue = jsonSetting(body, "brightness");
+  DisplayOrientation parsedOrientation = displayOrientation;
   if (mode.length() && !(mode == "none" || mode == "invert" || mode == "bars" || mode == "pgmpvw" || mode == "pvwpgm")) { restServer.send(400, "text/plain", "Invalid mode"); return; }
+  if (orientation.length() && !parseDisplayOrientation(orientation, parsedOrientation)) { restServer.send(400, "text/plain", "Invalid orientation"); return; }
   if (brightnessValue.length() && (brightnessValue.toInt() < 0 || brightnessValue.toInt() > 100)) { restServer.send(400, "text/plain", "Invalid brightness"); return; }
   if (mode.length()) { mode.toCharArray(bg_mode_str, sizeof(bg_mode_str)); bgMode = parseBgMode(bg_mode_str); applyBackgroundFromLastColor(); }
+  if (orientation.length()) { displayOrientation = parsedOrientation; applyDisplayOrientation(); }
   if (brightnessValue.length()) { brightness = brightnessValue.toInt(); setMatrixBrightnessFromPercent(brightness); }
   eepromSaveCompanionConfig(companion_host, companion_port);
+  if (orientation.length()) applyTextToParola();
   restServer.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1179,7 +1279,8 @@ void handleStatus() {
   json += "\"companionConnected\":" + String(client.connected() ? "true" : "false") + ",";
   json += "\"companion\":\"" + statusJsonEscape(String(companion_host) + ":" + companion_port) + "\",";
   json += "\"text\":\"" + statusJsonEscape(currentText) + "\",\"mode\":\"" + String(bg_mode_str) +
-    "\",\"brightness\":" + String(brightness) + ",";
+    "\",\"orientation\":\"" + String(displayOrientationName()) + "\",\"compactClock\":" +
+    String(isCompactClockText(currentText) ? "true" : "false") + ",\"brightness\":" + String(brightness) + ",";
   json += "\"color\":{\"valid\":" + String(lastColorValid ? "true" : "false") + ",\"r\":" +
     String(lastColorR) + ",\"g\":" + String(lastColorG) + ",\"b\":" + String(lastColorB) + "},";
   json += "\"uptimeSeconds\":" + String(millis() / 1000) + "}";
@@ -1191,10 +1292,13 @@ void handleDashboard() {
     "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>LED Matrix Clock</title>"
     "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
     "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
-    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>async function u(){try{let x=await(await fetch('/api/status')).json();"
-    "s.textContent=(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip;"
+    "<h3>Display settings</h3><label>Background mode <select id=bm><option value=none>None</option><option value=invert>Invert</option><option value=bars>Bars</option><option value=pgmpvw>PGM left / PVW right</option><option value=pvwpgm>PVW left / PGM right</option></select></label><br>"
+    "<label>Orientation <select id=dm><option value=180>180 degrees</option><option value=90cw>90 CW - mirror normal</option><option value=90ccw>90 CCW - mirror horizontal</option></select></label><br>"
+    "<label>Brightness <input id=br type=number min=0 max=100></label> <button onclick=v()>Save display settings</button><div id=o></div>"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "s.textContent=(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
     "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
-    "j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
+    "if(!loaded){bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
 
 void handlePostHost() {
@@ -1574,8 +1678,7 @@ void setup() {
 
   // Define a single zone 0 spanning all devices
   P.setZone(0, 0, MAX_DEVICES - 1);
-  // Flip left/right to match your 4,3,2,1 wiring so it reads 1-2-3-4
-  P.setZoneEffect(0, true, PA_FLIP_LR);
+  applyDisplayOrientation();
 
   // Ensure bars are off at boot
   updateBackgroundBars(false, false);
