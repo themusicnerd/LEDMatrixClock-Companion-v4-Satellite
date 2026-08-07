@@ -96,7 +96,7 @@ char matrixText[96];   // adjust size if you want longer max text
 bool textScrolls = false;
 
 // Parola timing
-const uint16_t scrollSpeed = 40;     // Lower = slower
+uint16_t scrollDelayMs = 40;         // Delay per animation step; lower = faster
 const uint16_t scrollPause = 0;      // Pause at end of scroll
 
 // Boot prompt timing
@@ -120,7 +120,8 @@ char bg_mode_str[16] = "invert";
 enum DisplayOrientation : uint8_t {
   ORIENTATION_180 = 0,
   ORIENTATION_90_CW,
-  ORIENTATION_90_CCW
+  ORIENTATION_90_CCW,
+  ORIENTATION_0
 };
 
 // Preserve the existing hardcoded PA_FLIP_LR behavior on upgrade.
@@ -178,9 +179,11 @@ const char* AP_password = "";
 // [50..65] = bg_mode_str (16 bytes)
 // [66]     = brightness (0-100)
 // [68]     = display orientation
+// [69]     = scroll step delay in milliseconds (10-250)
 const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
 const uint16_t EEPROM_ORIENTATION_ADDR = 68;
+const uint16_t EEPROM_SCROLL_DELAY_ADDR = 69;
 
 enum StartupAction : uint8_t {
   STARTUP_NORMAL = 0,
@@ -210,6 +213,7 @@ bool firstConnectionAttemptMade = false; // Track if first connection attempt wa
 unsigned long connectionStartTime = 0;
 bool connectingMessageShown = false;
 const unsigned long connectingMessageDelay = 1000; // 1 second
+const unsigned long companionHandshakeTimeout = 10000;
 bool connectionEstablished = false; // Track when connection is fully established
 
 // Brightness (0–100 from Companion)
@@ -303,9 +307,14 @@ void eepromLoadCompanionConfig() {
     }
 
     const uint8_t savedOrientation = EEPROM.read(EEPROM_ORIENTATION_ADDR);
-    displayOrientation = savedOrientation <= ORIENTATION_90_CCW
+    displayOrientation = savedOrientation <= ORIENTATION_0
       ? static_cast<DisplayOrientation>(savedOrientation)
       : ORIENTATION_90_CCW;
+
+    const uint8_t savedScrollDelay = EEPROM.read(EEPROM_SCROLL_DELAY_ADDR);
+    scrollDelayMs = (savedScrollDelay >= 10 && savedScrollDelay <= 250)
+      ? savedScrollDelay
+      : 40;
   } else {
     // No valid data - set defaults
     strcpy(companion_host, "192.168.1.100");
@@ -313,6 +322,7 @@ void eepromLoadCompanionConfig() {
     strcpy(bg_mode_str, "invert");
     brightness = 1; // default brightness
     displayOrientation = ORIENTATION_90_CCW;
+    scrollDelayMs = 40;
   }
   EEPROM.end();
 }
@@ -345,6 +355,7 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
   // brightness
   EEPROM.write(66, (uint8_t)brightness);
   EEPROM.write(EEPROM_ORIENTATION_ADDR, static_cast<uint8_t>(displayOrientation));
+  EEPROM.write(EEPROM_SCROLL_DELAY_ADDR, static_cast<uint8_t>(scrollDelayMs));
 
   EEPROM.commit();
   EEPROM.end();
@@ -398,6 +409,7 @@ BackgroundMode parseBgMode(const char* val) {
 
 const char* displayOrientationName() {
   switch (displayOrientation) {
+    case ORIENTATION_0:      return "0";
     case ORIENTATION_180:    return "180";
     case ORIENTATION_90_CW:  return "90cw";
     default:                 return "90ccw";
@@ -407,6 +419,7 @@ const char* displayOrientationName() {
 bool parseDisplayOrientation(const String& value, DisplayOrientation& parsed) {
   String normalized = value;
   normalized.toLowerCase();
+  if (normalized == "0")     { parsed = ORIENTATION_0; return true; }
   if (normalized == "180")   { parsed = ORIENTATION_180; return true; }
   if (normalized == "90cw")  { parsed = ORIENTATION_90_CW; return true; }
   if (normalized == "90ccw") { parsed = ORIENTATION_90_CCW; return true; }
@@ -668,7 +681,7 @@ void applyTextToParola() {
     P.displayText(
       matrixText,
       PA_LEFT,
-      scrollSpeed,
+      scrollDelayMs,
       scrollPause,
       PA_SCROLL_RIGHT,   // entry
       PA_SCROLL_RIGHT    // exit
@@ -1246,23 +1259,26 @@ String jsonSetting(const String& body, const char* name) {
 
 void handleGetSettings() {
   const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"orientation\":\"" +
-    String(displayOrientationName()) + "\",\"brightness\":" + String(brightness) + "}";
+    String(displayOrientationName()) + "\",\"brightness\":" + String(brightness) +
+    ",\"scrollDelayMs\":" + String(scrollDelayMs) + "}";
   restServer.send(200, "application/json", json);
 }
 
 void handlePostSettings() {
   const String body = restServer.arg("plain");
   const String mode = jsonSetting(body, "mode"), orientation = jsonSetting(body, "orientation"),
-    brightnessValue = jsonSetting(body, "brightness");
+    brightnessValue = jsonSetting(body, "brightness"), scrollDelayValue = jsonSetting(body, "scrollDelayMs");
   DisplayOrientation parsedOrientation = displayOrientation;
   if (mode.length() && !(mode == "none" || mode == "invert" || mode == "bars" || mode == "pgmpvw" || mode == "pvwpgm")) { restServer.send(400, "text/plain", "Invalid mode"); return; }
   if (orientation.length() && !parseDisplayOrientation(orientation, parsedOrientation)) { restServer.send(400, "text/plain", "Invalid orientation"); return; }
   if (brightnessValue.length() && (brightnessValue.toInt() < 0 || brightnessValue.toInt() > 100)) { restServer.send(400, "text/plain", "Invalid brightness"); return; }
+  if (scrollDelayValue.length() && (scrollDelayValue.toInt() < 10 || scrollDelayValue.toInt() > 250)) { restServer.send(400, "text/plain", "Invalid scroll delay"); return; }
   if (mode.length()) { mode.toCharArray(bg_mode_str, sizeof(bg_mode_str)); bgMode = parseBgMode(bg_mode_str); applyBackgroundFromLastColor(); }
   if (orientation.length()) { displayOrientation = parsedOrientation; applyDisplayOrientation(); }
   if (brightnessValue.length()) { brightness = brightnessValue.toInt(); setMatrixBrightnessFromPercent(brightness); }
+  if (scrollDelayValue.length()) scrollDelayMs = scrollDelayValue.toInt();
   eepromSaveCompanionConfig(companion_host, companion_port);
-  if (orientation.length()) applyTextToParola();
+  if (orientation.length() || scrollDelayValue.length()) applyTextToParola();
   restServer.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1280,7 +1296,8 @@ void handleStatus() {
   json += "\"companion\":\"" + statusJsonEscape(String(companion_host) + ":" + companion_port) + "\",";
   json += "\"text\":\"" + statusJsonEscape(currentText) + "\",\"mode\":\"" + String(bg_mode_str) +
     "\",\"orientation\":\"" + String(displayOrientationName()) + "\",\"compactClock\":" +
-    String(isCompactClockText(currentText) ? "true" : "false") + ",\"brightness\":" + String(brightness) + ",";
+    String(isCompactClockText(currentText) ? "true" : "false") + ",\"brightness\":" + String(brightness) +
+    ",\"scrollDelayMs\":" + String(scrollDelayMs) + ",";
   json += "\"color\":{\"valid\":" + String(lastColorValid ? "true" : "false") + ",\"r\":" +
     String(lastColorR) + ",\"g\":" + String(lastColorG) + ",\"b\":" + String(lastColorB) + "},";
   json += "\"uptimeSeconds\":" + String(millis() / 1000) + "}";
@@ -1293,12 +1310,13 @@ void handleDashboard() {
     "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
     "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
     "<h3>Display settings</h3><label>Background mode <select id=bm><option value=none>None</option><option value=invert>Invert</option><option value=bars>Bars</option><option value=pgmpvw>PGM left / PVW right</option><option value=pvwpgm>PVW left / PGM right</option></select></label><br>"
-    "<label>Orientation <select id=dm><option value=180>180 degrees</option><option value=90cw>90 CW - mirror normal</option><option value=90ccw>90 CCW - mirror horizontal</option></select></label><br>"
-    "<label>Brightness <input id=br type=number min=0 max=100></label> <button onclick=v()>Save display settings</button><div id=o></div>"
-    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror normal</option><option value=90ccw>90 CCW - mirror horizontal</option></select></label><br>"
+    "<label>Brightness <input id=br type=number min=0 max=100></label><br>"
+    "<label>Scroll step delay <input id=sd type=number min=10 max=250> ms <small>(lower is faster; default 40)</small></label> <button onclick=v()>Save display settings</button><div id=o></div>"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
     "s.textContent=(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
     "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
-    "if(!loaded){bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
+    "if(!loaded){bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
 
 void handlePostHost() {
@@ -1779,6 +1797,18 @@ void loop() {
     setText("Connecting...");
     connectingMessageShown = true;
     Serial.println("[Display] Showing Connecting... after 1s delay");
+  }
+
+  // A TCP socket can survive while Companion has discarded the old Satellite
+  // session. If no protocol data arrives, reconnect instead of remaining in a
+  // connected-but-unresponsive state indefinitely.
+  if (client.connected() && !connectionEstablished && connectionStartTime > 0 &&
+      (now - connectionStartTime >= companionHandshakeTimeout)) {
+    Serial.println("[NET] Companion handshake timed out; reconnecting");
+    client.stop();
+    connectionStartTime = 0;
+    connectingMessageShown = false;
+    lastConnectTry = 0;
   }
 
   // Handle Companion traffic

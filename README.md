@@ -17,7 +17,7 @@ Buy the units here: https://www.aliexpress.com/item/1005006038630745.html
   - `pvwpgm` – left bars = PVW (green ≥ 128), right bars = PGM (red ≥ 128)
 - ✅ **Brightness** control via Companion BRIGHTNESS (0–100 → 0–15 LED intensity)
 - ✅ Static compact rendering for numeric `HH:MM:SS` / `NN:NN:NN` text
-- ✅ Selectable display orientation: `180`, `90 CW`, or `90 CCW`
+- ✅ Selectable display orientation: `0`, `180`, `90 CW`, or `90 CCW`
 - ✅ **WiFiManager** config portal (for WiFi + Companion IP/port + bgmode)
 - ✅ Companion IP/port + background mode stored in **EEPROM**
 - ✅ Companion auto-discovery through `_companion-satellite._tcp` mDNS, including one-click REST setup
@@ -195,15 +195,18 @@ Browse to `http://<device-ip>:9999/` for the live troubleshooting dashboard.
 It shows the device name and ID, Wi-Fi and Companion connection status, IP
 address, matrix mode, brightness, latest incoming text and RGB colour, and
 uptime. The dashboard refreshes every two seconds. Its **Display settings** form
-also lets you view and change the background mode, orientation, and brightness.
+also lets you view and change the background mode, orientation, brightness, and
+scroll step delay. The default delay is `40 ms`; lower values scroll faster and
+higher values scroll slower. The supported range is `10–250 ms`.
 
 The orientation choices are:
 
+- `0°` — normal display orientation.
 - `180°` — flip the matrix horizontally and vertically.
 - `90° CW` — normal mirroring (no additional flip).
 - `90° CCW` — flip horizontally.
 
-Orientation is saved in EEPROM and restored after reboot.
+Orientation and scroll speed are saved in EEPROM and restored after reboot.
 
 ## Companion discovery and setup menu
 
