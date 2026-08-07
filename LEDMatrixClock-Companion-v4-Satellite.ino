@@ -1817,8 +1817,12 @@ void loop() {
       String line = client.readStringUntil('\n');
       line.trim();
       if (line.length() > 0) {
-        // Mark connection as established and stop showing Connecting...
-        if (!connectionEstablished) {
+        // Heartbeats only prove that the TCP socket is alive. Wait for an
+        // actual display command before considering Satellite registration
+        // complete, otherwise a stale session can remain unresponsive.
+        const bool displayCommand = line.startsWith("KEY-STATE") ||
+          line.startsWith("KEYS-CLEAR") || line.startsWith("BRIGHTNESS");
+        if (!connectionEstablished && displayCommand) {
           connectionEstablished = true;
           connectingMessageShown = false;
           Serial.println("[Display] Connection established - stopping Connecting...");
