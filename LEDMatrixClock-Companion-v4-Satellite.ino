@@ -22,8 +22,7 @@
   Config behaviour:
     - WiFi fails => WiFiManager config portal (standard)
     - Companion down => keep retrying, NO config portal
-    - Reset during 5s "CONFIG?" window =>
-      next boot triggers config portal via boot counter
+    - Hold DOWNLOAD for 2 seconds after boot => setup menu
 
   Background handling modes (configurable via WiFiManager):
     - none    : ignore COLOR, no invert, no bars
@@ -45,6 +44,8 @@
 #include <EEPROM.h>
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
+
+const char* FIRMWARE_VERSION = "1.4.4";
 #include <SPI.h>
 #include <vector>
 #include <ESP8266mDNS.h>
@@ -73,6 +74,23 @@ MD_Parola P = MD_Parola(HARDWARE_TYPE, PIN_CS, MAX_DEVICES);
 // Underlying MAX72xx object for direct column control (bars)
 MD_MAX72XX* mx = nullptr;
 
+// Compact 3x7 numeric font for fixed NN:NN:NN displays. Six 3-column digits,
+// two 1-column colons and seven 1-column spaces use 27 of the 32 columns.
+MD_MAX72XX::fontType_t compactClockFont[] PROGMEM = {
+  'F', 1, '0', ':', 7,
+  3, 0x7F, 0x41, 0x7F, // 0
+  3, 0x00, 0x7F, 0x00, // 1
+  3, 0x79, 0x49, 0x4F, // 2
+  3, 0x49, 0x49, 0x7F, // 3
+  3, 0x0F, 0x08, 0x7F, // 4
+  3, 0x4F, 0x49, 0x79, // 5
+  3, 0x7F, 0x49, 0x79, // 6
+  3, 0x01, 0x01, 0x7F, // 7
+  3, 0x7F, 0x49, 0x7F, // 8
+  3, 0x4F, 0x49, 0x7F, // 9
+  1, 0x22              // :
+};
+
 // Global text buffer that Parola will use (must stay valid!)
 char matrixText[96];   // adjust size if you want longer max text
 
@@ -80,7 +98,7 @@ char matrixText[96];   // adjust size if you want longer max text
 bool textScrolls = false;
 
 // Parola timing
-const uint16_t scrollSpeed = 40;     // Lower = slower
+uint16_t scrollDelayMs = 40;         // Delay per animation step; lower = faster
 const uint16_t scrollPause = 0;      // Pause at end of scroll
 
 // Boot prompt timing
@@ -100,6 +118,16 @@ BackgroundMode bgMode = BG_INVERT;          // default behaviour
 
 // Stored as text for WiFiManager & EEPROM
 char bg_mode_str[16] = "invert";
+
+enum DisplayOrientation : uint8_t {
+  ORIENTATION_180 = 0,
+  ORIENTATION_90_CW,
+  ORIENTATION_90_CCW,
+  ORIENTATION_0
+};
+
+// Preserve the existing hardcoded PA_FLIP_LR behavior on upgrade.
+DisplayOrientation displayOrientation = ORIENTATION_90_CCW;
 
 // Last COLOR received
 int  lastColorR = 0;
@@ -133,6 +161,8 @@ WiFiManagerParameter* custom_bgMode;     // background handling mode
 
 // Device ID and hostname
 String deviceID;
+String configuredDeviceName;
+String serialProvisionBuffer;
 bool mdnsStarted = false;
 
 // GPIO0 is a boot strap pin: holding DOWNLOAD while resetting starts the
@@ -152,10 +182,14 @@ const char* AP_password = "";
 // [43..48] = companion_port (6 bytes)
 // [50..65] = bg_mode_str (16 bytes)
 // [66]     = brightness (0-100)
-// [60]     = bootCounter
+// [68]     = display orientation
+// [69]     = scroll step delay in milliseconds (10-250)
 const uint16_t EEPROM_SIZE      = 128;
-const uint16_t EEPROM_BOOT_ADDR = 60;
 const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
+const uint16_t EEPROM_ORIENTATION_ADDR = 68;
+const uint16_t EEPROM_SCROLL_DELAY_ADDR = 69;
+const uint16_t EEPROM_DEVICE_NAME_ADDR = 102;
+const uint8_t EEPROM_DEVICE_NAME_LENGTH = 26;
 
 enum StartupAction : uint8_t {
   STARTUP_NORMAL = 0,
@@ -185,22 +219,8 @@ bool firstConnectionAttemptMade = false; // Track if first connection attempt wa
 unsigned long connectionStartTime = 0;
 bool connectingMessageShown = false;
 const unsigned long connectingMessageDelay = 1000; // 1 second
+const unsigned long companionHandshakeTimeout = 10000;
 bool connectionEstablished = false; // Track when connection is fully established
-
-// How many previous boots before forcing config portal
-const uint8_t BOOT_FAIL_LIMIT = 1;
-
-// Config state tracking
-enum ConfigState {
-  CFG_NORMAL = 0,
-  CFG_REQUESTED = 1,
-  CFG_ACTIVE = 2
-};
-
-ConfigState configState = CFG_NORMAL;
-
-// Cached copy of PRE-INCREMENT boot counter (from EEPROM)
-uint8_t bootCountCached = 0;
 
 // Brightness (0–100 from Companion)
 int brightness = 1;
@@ -256,8 +276,26 @@ extern String firmwareUpdatePassword;
 void eepromLoadCompanionConfig() {
   EEPROM.begin(EEPROM_SIZE);
   char updatePassword[33] = {};
-  for (uint8_t i = 0; i < 32; ++i) updatePassword[i] = EEPROM.read(70 + i);
+  // Fresh/older installations leave this EEPROM region erased (0xFF). Treat
+  // that state as the documented empty password instead of locking OTA behind
+  // an impossible 32-byte password.
+  if (EEPROM.read(70) != 0xFF) {
+    for (uint8_t i = 0; i < 32; ++i) {
+      const uint8_t savedByte = EEPROM.read(70 + i);
+      if (savedByte == 0 || savedByte == 0xFF) break;
+      updatePassword[i] = static_cast<char>(savedByte);
+    }
+  }
   firmwareUpdatePassword = String(updatePassword);
+  char savedDeviceName[EEPROM_DEVICE_NAME_LENGTH] = {};
+  if (EEPROM.read(EEPROM_DEVICE_NAME_ADDR) != 0xFF) {
+    for (uint8_t i = 0; i < EEPROM_DEVICE_NAME_LENGTH - 1; ++i) {
+      const uint8_t savedByte = EEPROM.read(EEPROM_DEVICE_NAME_ADDR + i);
+      if (savedByte == 0 || savedByte == 0xFF) break;
+      savedDeviceName[i] = static_cast<char>(savedByte);
+    }
+  }
+  configuredDeviceName = String(savedDeviceName);
   if (EEPROM.read(0) == 'L' && EEPROM.read(1) == 'M') {
     // Valid header
     for (int i = 0; i < 40; i++) {
@@ -282,12 +320,24 @@ void eepromLoadCompanionConfig() {
     if (brightness < 0 || brightness > 100) {
       brightness = 1; // default if invalid
     }
+
+    const uint8_t savedOrientation = EEPROM.read(EEPROM_ORIENTATION_ADDR);
+    displayOrientation = savedOrientation <= ORIENTATION_0
+      ? static_cast<DisplayOrientation>(savedOrientation)
+      : ORIENTATION_90_CCW;
+
+    const uint8_t savedScrollDelay = EEPROM.read(EEPROM_SCROLL_DELAY_ADDR);
+    scrollDelayMs = (savedScrollDelay >= 10 && savedScrollDelay <= 250)
+      ? savedScrollDelay
+      : 40;
   } else {
     // No valid data - set defaults
     strcpy(companion_host, "192.168.1.100");
     strcpy(companion_port, "9999");
     strcpy(bg_mode_str, "invert");
     brightness = 1; // default brightness
+    displayOrientation = ORIENTATION_90_CCW;
+    scrollDelayMs = 40;
   }
   EEPROM.end();
 }
@@ -319,25 +369,15 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
 
   // brightness
   EEPROM.write(66, (uint8_t)brightness);
+  EEPROM.write(EEPROM_ORIENTATION_ADDR, static_cast<uint8_t>(displayOrientation));
+  EEPROM.write(EEPROM_SCROLL_DELAY_ADDR, static_cast<uint8_t>(scrollDelayMs));
+  for (uint8_t i = 0; i < EEPROM_DEVICE_NAME_LENGTH; ++i) {
+    const char c = i < configuredDeviceName.length() ? configuredDeviceName[i] : 0;
+    EEPROM.write(EEPROM_DEVICE_NAME_ADDR + i, static_cast<uint8_t>(c));
+  }
 
   EEPROM.commit();
   EEPROM.end();
-}
-
-uint8_t eepromReadBootCounter() {
-  EEPROM.begin(EEPROM_SIZE);
-  uint8_t c = EEPROM.read(EEPROM_BOOT_ADDR);
-  EEPROM.end();
-  Serial.printf("[EEPROM] Read boot counter: %u\n", c);
-  return c;
-}
-
-void eepromWriteBootCounter(uint8_t c) {
-  EEPROM.begin(EEPROM_SIZE);
-  EEPROM.write(EEPROM_BOOT_ADDR, c);
-  bool commitResult = EEPROM.commit();
-  EEPROM.end();
-  Serial.printf("[EEPROM] Write boot counter: %u, commit result: %s\n", c, commitResult ? "SUCCESS" : "FAILED");
 }
 
 StartupAction eepromReadStartupAction() {
@@ -386,6 +426,44 @@ BackgroundMode parseBgMode(const char* val) {
   return BG_INVERT;
 }
 
+const char* displayOrientationName() {
+  switch (displayOrientation) {
+    case ORIENTATION_0:      return "0";
+    case ORIENTATION_180:    return "180";
+    case ORIENTATION_90_CW:  return "90cw";
+    default:                 return "90ccw";
+  }
+}
+
+bool parseDisplayOrientation(const String& value, DisplayOrientation& parsed) {
+  String normalized = value;
+  normalized.toLowerCase();
+  if (normalized == "0")     { parsed = ORIENTATION_0; return true; }
+  if (normalized == "180")   { parsed = ORIENTATION_180; return true; }
+  if (normalized == "90cw")  { parsed = ORIENTATION_90_CW; return true; }
+  if (normalized == "90ccw") { parsed = ORIENTATION_90_CCW; return true; }
+  return false;
+}
+
+void applyDisplayOrientation() {
+  P.setZoneEffect(0, false, PA_FLIP_LR);
+  P.setZoneEffect(0, false, PA_FLIP_UD);
+
+  if (displayOrientation == ORIENTATION_0) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+  } else if (displayOrientation == ORIENTATION_180) {
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  } else if (displayOrientation == ORIENTATION_90_CCW) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  }
+
+  Serial.printf("[DISPLAY] Orientation=%s flipLR=%s flipUD=%s\n",
+    displayOrientationName(),
+    P.getZoneEffect(0, PA_FLIP_LR) ? "true" : "false",
+    P.getZoneEffect(0, PA_FLIP_UD) ? "true" : "false");
+}
+
 // Draw/update edge bars based on booleans
 void updateBackgroundBars(bool leftOn, bool rightOn) {
   barLeftOn  = leftOn;
@@ -407,6 +485,17 @@ void updateBackgroundBars(bool leftOn, bool rightOn) {
   uint8_t c1 = maxCols - 1;
   mx->setColumn(c0, rightOn ? colOn : colOff);
   mx->setColumn(c1, rightOn ? colOn : colOff);
+}
+
+bool barsNeedOverlay() {
+  return client.connected() &&
+    (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM);
+}
+
+void finishAtomicMatrixRender(bool atomicRender, bool preserveBars) {
+  if (!atomicRender || !mx) return;
+  if (preserveBars) updateBackgroundBars(barLeftOn, barRightOn);
+  mx->update(MD_MAX72XX::ON);
 }
 
 // Apply background/invert/bars for a given color and current bgMode
@@ -458,7 +547,14 @@ void applyBackgroundFromColor(int r, int g, int b) {
       break;
   }
 
-  updateBackgroundBars(left, right);
+  if (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM) {
+    updateBackgroundBars(left, right);
+  } else {
+    // In none/invert modes the edge columns belong to the text/background.
+    // Do not blank them ahead of the next atomic text frame.
+    barLeftOn = false;
+    barRightOn = false;
+  }
 
   Serial.printf(
     "[BG] Mode=%d  R=%d G=%d B=%d  invert=%s  left=%s right=%s\n",
@@ -493,7 +589,6 @@ String getParam(const String& name) {
 void saveParamCallback() {
   String str_companionIP   = getParam("companionIP");
   String str_companionPort = getParam("companionPort");
-  String str_bootCount     = getParam("bootCount");
   String str_bgMode        = getParam("bgmode");
 
   if (str_companionIP.length() > 0) {
@@ -513,10 +608,7 @@ void saveParamCallback() {
   applyBackgroundFromLastColor();
 
   eepromSaveCompanionConfig(companion_host, companion_port);
-  
-  // Reset boot counter to 0 to ensure we exit config mode if WiFiManager reboots
-  eepromWriteBootCounter(0);
-  Serial.println("[WiFi] Settings saved - boot counter reset to 0 for normal boot");
+  Serial.println("[WiFi] Settings saved");
 }
 
 // ------------------------------------------------------------
@@ -541,14 +633,32 @@ void showBootMessage(const String& msg) {
 
 // Decide whether we can center text or need to scroll
 // Very approximate: assume ~6px per char on default font.
+bool isCompactClockText(const String& txt) {
+  if (txt.length() != 8 || txt[2] != ':' || txt[5] != ':') return false;
+  for (uint8_t i = 0; i < 8; i++) {
+    if (i == 2 || i == 5) continue;
+    if (txt[i] < '0' || txt[i] > '9') return false;
+  }
+  return true;
+}
+
 void applyTextToParola() {
   String txt = currentText;
+  const bool atomicRender = mx != nullptr;
+  const bool preserveBars = barsNeedOverlay() && mx;
+
+  // Prevent clear/invert/text/bar operations from reaching the LEDs separately.
+  // The complete static frame or scrolling setup is flushed in one update.
+  if (atomicRender) mx->update(MD_MAX72XX::OFF);
 
   if (txt.length() == 0) {
     P.displayClear();
     textScrolls = false;
+    finishAtomicMatrixRender(atomicRender, preserveBars);
     return;
   }
+
+  const bool compactClock = isCompactClockText(txt);
 
   // lowercase detection left in, if you want to change font later
   bool hasLower = false;
@@ -560,8 +670,8 @@ void applyTextToParola() {
   }
   useBigFont = !hasLower;
 
-  // Use default internal font
-  P.setFont(nullptr);
+  P.setFont(compactClock ? compactClockFont : nullptr);
+  P.setCharSpacing(1);
 
   // Apply invert state (for BG_INVERT only)
   P.setInvert(invertDisplay);
@@ -578,7 +688,7 @@ void applyTextToParola() {
 
   uint16_t maxCols    = MAX_DEVICES * 8;
   uint16_t charWidth  = useBigFont ? 8 : 6;
-  uint16_t textWidth  = len * charWidth;
+  uint16_t textWidth  = compactClock ? 27 : len * charWidth;
   bool textFits       = (textWidth <= maxCols);
 
   // Also treat “short” text as fitting even if estimate is wrong
@@ -599,6 +709,11 @@ void applyTextToParola() {
     textFits = true;
   }
 
+  // Fixed compact clock values always fit and must never scroll.
+  if (compactClock) {
+    textFits = true;
+  }
+
   P.displayClear();
 
   if (textFits) {
@@ -607,23 +722,25 @@ void applyTextToParola() {
     P.setTextAlignment(PA_CENTER);
     P.print(matrixText);
   } else {
-    // Scrolling text (right-to-left on your flipped modules)
+    // Keep the physical motion right-to-left. PA_FLIP_LR reverses Parola's
+    // logical animation direction, so mirrored orientations need the opposite
+    // effect from non-mirrored orientations.
     textScrolls = true;
+    const bool horizontallyFlipped = displayOrientation == ORIENTATION_0 ||
+      displayOrientation == ORIENTATION_90_CCW;
+    const textEffect_t scrollEffect = horizontallyFlipped ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
     P.displayText(
       matrixText,
       PA_LEFT,
-      scrollSpeed,
+      scrollDelayMs,
       scrollPause,
-      PA_SCROLL_RIGHT,   // entry
-      PA_SCROLL_RIGHT    // exit
+      scrollEffect,
+      scrollEffect
     );
     P.displayReset();
   }
 
-  // Reapply bars on top of whatever we just drew (modes that use bars) - only when Companion is connected
-  if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
-    updateBackgroundBars(barLeftOn, barRightOn);
-  }
+  finishAtomicMatrixRender(atomicRender, preserveBars);
 }
 
 void setTextNow(const String& txt) {
@@ -843,7 +960,6 @@ void showConfigModeMessage() {
 
 void startConfigPortal() {
   Serial.println("[WiFi] Entering CONFIG PORTAL mode");
-  configState = CFG_ACTIVE;
   
   // Load Companion config from EEPROM (for default field values)
   eepromLoadCompanionConfig();
@@ -901,10 +1017,6 @@ void startConfigPortal() {
   applyBackgroundFromLastColor();
 
   eepromSaveCompanionConfig(companion_host, companion_port);
-
-  // Reset boot counter so we do not immediately re-enter config
-  eepromWriteBootCounter(0);
-  configState = CFG_NORMAL;
 
   // Show a small message so you know it applied
   showBootMessage("CFG SAVED");
@@ -1093,8 +1205,6 @@ void connectToNetwork() {
   bgMode = parseBgMode(bg_mode_str);
   applyBackgroundFromLastColor();
 
-  Serial.printf("[Boot] Cached boot counter (prev boot) = %u\n", bootCountCached);
-
   // ---------- Prepare WiFiManager with params BEFORE any portal ----------
 
   // Companion IP / Port params
@@ -1130,6 +1240,7 @@ void connectToNetwork() {
   // -----------------------------------------------------------------------
 
   // Normal autoConnect behaviour (connect to WiFi, or start portal if no WiFi)
+  wifiManager.setConfigPortalBlocking(false);
   // Show "WiFi" during connection attempt
   showBootMessage("WiFi ?");
   
@@ -1164,9 +1275,6 @@ void connectToNetwork() {
 
   eepromSaveCompanionConfig(companion_host, companion_port);
 
-  // WiFi successfully connected => clear boot counter
-  eepromWriteBootCounter(0);
-  Serial.println("[Boot] Boot counter reset to 0 (WiFi !)");
 }
 
 // ------------------------------------------------------------
@@ -1186,6 +1294,124 @@ void handleGetConfig() {
   String json = "{\"host\":\"" + String(companion_host) + "\",\"port\":" + String(companion_port) + "}";
   restServer.send(200, "application/json", json);
   Serial.println("[REST] GET /api/config: " + json);
+}
+
+String jsonSetting(const String& body, const char* name) {
+  const String key = String("\"") + name + "\"";
+  int pos = body.indexOf(key); if (pos < 0) return "";
+  pos = body.indexOf(':', pos + key.length()); if (pos < 0) return "";
+  pos++; while (pos < body.length() && isspace(body[pos])) pos++;
+  if (pos < body.length() && body[pos] == '\"') { const int end = body.indexOf('\"', ++pos); return end < 0 ? "" : body.substring(pos, end); }
+  int end = pos; while (end < body.length() && body[end] != ',' && body[end] != '}') end++;
+  String value = body.substring(pos, end); value.trim(); return value;
+}
+
+void handleSerialProvisioning() {
+  while (Serial.available()) {
+    const char c = Serial.read();
+    if (c == '\n') {
+      serialProvisionBuffer.trim();
+      if (serialProvisionBuffer.startsWith("PROVISION ")) {
+        const String body = serialProvisionBuffer.substring(10);
+        const String ssid = jsonSetting(body, "ssid"), password = jsonSetting(body, "password");
+        const String host = jsonSetting(body, "companionHost"), port = jsonSetting(body, "companionPort"), name = jsonSetting(body, "deviceName");
+        if (port.length() && (port.toInt() < 1 || port.toInt() > 65535)) Serial.println("PROVISION-ERROR invalid companionPort");
+        else {
+          if (host.length()) host.toCharArray(companion_host, sizeof(companion_host));
+          if (port.length()) port.toCharArray(companion_port, sizeof(companion_port));
+          if (name.length()) configuredDeviceName = name.substring(0, EEPROM_DEVICE_NAME_LENGTH - 1);
+          eepromSaveCompanionConfig(companion_host, companion_port);
+          Serial.println("PROVISION-OK");
+          if (ssid.length()) { delay(100); WiFi.persistent(true); WiFi.begin(ssid.c_str(), password.c_str()); }
+        }
+      }
+      serialProvisionBuffer = "";
+    } else if (c != '\r' && serialProvisionBuffer.length() < 512) serialProvisionBuffer += c;
+  }
+}
+
+void handlePostHardwareTest() {
+  const String target = jsonSetting(restServer.arg("plain"), "target");
+  const String value = jsonSetting(restServer.arg("plain"), "value");
+  if (target == "text" && value.length()) {
+    setText(value.substring(0, sizeof(matrixText) - 1));
+  } else if (target == "display" && value == "white") {
+    P.getGraphicObject()->control(MD_MAX72XX::TEST, MD_MAX72XX::ON);
+  } else if (target == "display" && value == "off") {
+    P.getGraphicObject()->control(MD_MAX72XX::TEST, MD_MAX72XX::OFF);
+    P.displayClear();
+  } else {
+    restServer.send(400, "text/plain", "Use display white/off or provide text"); return;
+  }
+  restServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleGetSettings() {
+  const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"orientation\":\"" +
+    String(displayOrientationName()) + "\",\"brightness\":" + String(brightness) +
+    ",\"scrollDelayMs\":" + String(scrollDelayMs) + "}";
+  restServer.send(200, "application/json", json);
+}
+
+void handlePostSettings() {
+  const String body = restServer.arg("plain");
+  const String mode = jsonSetting(body, "mode"), orientation = jsonSetting(body, "orientation"),
+    brightnessValue = jsonSetting(body, "brightness"), scrollDelayValue = jsonSetting(body, "scrollDelayMs");
+  DisplayOrientation parsedOrientation = displayOrientation;
+  if (mode.length() && !(mode == "none" || mode == "invert" || mode == "bars" || mode == "pgmpvw" || mode == "pvwpgm")) { restServer.send(400, "text/plain", "Invalid mode"); return; }
+  if (orientation.length() && !parseDisplayOrientation(orientation, parsedOrientation)) { restServer.send(400, "text/plain", "Invalid orientation"); return; }
+  if (brightnessValue.length() && (brightnessValue.toInt() < 0 || brightnessValue.toInt() > 100)) { restServer.send(400, "text/plain", "Invalid brightness"); return; }
+  if (scrollDelayValue.length() && (scrollDelayValue.toInt() < 10 || scrollDelayValue.toInt() > 250)) { restServer.send(400, "text/plain", "Invalid scroll delay"); return; }
+  if (mode.length()) { mode.toCharArray(bg_mode_str, sizeof(bg_mode_str)); bgMode = parseBgMode(bg_mode_str); applyBackgroundFromLastColor(); }
+  if (orientation.length()) { displayOrientation = parsedOrientation; applyDisplayOrientation(); }
+  if (brightnessValue.length()) { brightness = brightnessValue.toInt(); setMatrixBrightnessFromPercent(brightness); }
+  if (scrollDelayValue.length()) scrollDelayMs = scrollDelayValue.toInt();
+  eepromSaveCompanionConfig(companion_host, companion_port);
+  if (mode.length() || orientation.length() || scrollDelayValue.length()) applyTextToParola();
+  restServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+String statusJsonEscape(String value) {
+  value.replace("\\", "\\\\"); value.replace("\"", "\\\"");
+  value.replace("\n", "\\n"); value.replace("\r", "\\r");
+  return value;
+}
+
+void handleStatus() {
+  String json = "{\"deviceName\":\"" + statusJsonEscape(configuredDeviceName.length() ? configuredDeviceName : "LED Matrix Clock") + "\",\"firmwareVersion\":\"" +
+    String(FIRMWARE_VERSION) + "\",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
+  json += "\"network\":\"wifi\",\"networkConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"ssid\":\"" + statusJsonEscape(WiFi.SSID()) + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"companionConnected\":" + String(client.connected() ? "true" : "false") + ",";
+  json += "\"companion\":\"" + statusJsonEscape(String(companion_host) + ":" + companion_port) + "\",";
+  json += "\"text\":\"" + statusJsonEscape(currentText) + "\",\"mode\":\"" + String(bg_mode_str) +
+    "\",\"orientation\":\"" + String(displayOrientationName()) + "\",\"compactClock\":" +
+    String(isCompactClockText(currentText) ? "true" : "false") + ",\"brightness\":" + String(brightness) +
+    ",\"scrollDelayMs\":" + String(scrollDelayMs) + ",\"buttonPressed\":" + String(digitalRead(PIN_DOWNLOAD) == LOW ? "true" : "false") + ",";
+  json += "\"color\":{\"valid\":" + String(lastColorValid ? "true" : "false") + ",\"r\":" +
+    String(lastColorR) + ",\"g\":" + String(lastColorG) + ",\"b\":" + String(lastColorB) + "},";
+  json += "\"uptimeSeconds\":" + String(millis() / 1000) + "}";
+  restServer.send(200, "application/json", json);
+}
+
+void handleDashboard() {
+  restServer.send(200, "text/html",
+    "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>LED Matrix Clock</title>"
+    "<h2>LED Matrix Clock Companion Satellite</h2><h3>Live troubleshooting status</h3><div id=s>Loading...</div>"
+    "<p>Incoming text: <code id=t>-</code></p><p>Incoming colour: <span id=w style='display:inline-block;width:2em;height:1em;border:1px solid'></span> <code id=c>-</code></p>"
+    "<h3>Companion settings</h3><label>Companion IP / hostname <input id=ch maxlength=39></label><br>"
+    "<label>Satellite port <input id=cp type=number min=1 max=65535></label> <button onclick=cg()>Save and reconnect</button><div id=co></div>"
+    "<h3>Display settings</h3><label>Background mode <select id=bm><option value=none>None</option><option value=invert>Invert</option><option value=bars>Bars</option><option value=pgmpvw>PGM left / PVW right</option><option value=pvwpgm>PVW left / PGM right</option></select></label><br>"
+    "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror</option><option value=90ccw>90 CCW - flip / mirror</option></select></label><br>"
+    "<label>Brightness <input id=br type=number min=0 max=100></label><br>"
+    "<label>Scroll step delay <input id=sd type=number min=10 max=250> ms <small>(lower is faster; default 40)</small></label> <button onclick=v()>Save display settings</button><div id=o></div>"
+    "<h3>Hardware tests</h3><p>DOWNLOAD button: <strong id=bt>released</strong></p>"
+    "<p><button onclick=tt('display','white')>All pixels on</button> <button onclick=tt('display','off')>Display off</button></p>"
+    "<p><input id=tx maxlength=95 placeholder='Matrix test text'><button onclick=tt('text',tx.value)>Show text</button></p>"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function cg(){let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ch.value.trim(),port:+cp.value})});co.textContent=await r.text();loaded=false}async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function tt(target,value){let r=await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,value})});j.textContent=await r.text()}async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "s.textContent='Firmware v'+x.firmwareVersion+' | '+(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
+    "t.textContent=x.text||'(none)';bt.textContent=x.buttonPressed?'PRESSED':'released';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
+    "if(!loaded){let g=await(await fetch('/api/config')).json();ch.value=g.host;cp.value=g.port;bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
 
 void handlePostHost() {
@@ -1443,13 +1669,18 @@ void handleFirmwareUpdatePassword() {
 
 void setupRestAPI() {
   // Register endpoints
+  restServer.on("/", HTTP_GET, handleDashboard);
   restServer.on("/api/host", HTTP_GET, handleGetHost);
   restServer.on("/api/port", HTTP_GET, handleGetPort);
   restServer.on("/api/config", HTTP_GET, handleGetConfig);
+  restServer.on("/api/settings", HTTP_GET, handleGetSettings);
+  restServer.on("/api/status", HTTP_GET, handleStatus);
   
   restServer.on("/api/host", HTTP_POST, handlePostHost);
   restServer.on("/api/port", HTTP_POST, handlePostPort);
   restServer.on("/api/config", HTTP_POST, handlePostConfig);
+  restServer.on("/api/settings", HTTP_POST, handlePostSettings);
+  restServer.on("/api/test", HTTP_POST, handlePostHardwareTest);
   restServer.on("/update", HTTP_GET, handleFirmwareUpdatePage);
   restServer.on("/update", HTTP_POST, handleFirmwareUpdateResult, handleFirmwareUpload);
   restServer.on("/update/password", HTTP_POST, handleFirmwareUpdatePassword);
@@ -1502,6 +1733,7 @@ void setupMDNS() {
   MDNS.addServiceTxt("companion-satellite", "tcp", "prefix", "led-matrix");
   MDNS.addServiceTxt("companion-satellite", "tcp", "productName", "LED Matrix");
   MDNS.addServiceTxt("companion-satellite", "tcp", "apiVersion", "4");
+  MDNS.addServiceTxt("companion-satellite", "tcp", "firmwareVersion", FIRMWARE_VERSION);
 
   mdnsStarted = true;
   Serial.printf("[mDNS] Advertising %s on port 9999\n", mDNSInstanceName.c_str());
@@ -1561,8 +1793,7 @@ void setup() {
 
   // Define a single zone 0 spanning all devices
   P.setZone(0, 0, MAX_DEVICES - 1);
-  // Flip left/right to match your 4,3,2,1 wiring so it reads 1-2-3-4
-  P.setZoneEffect(0, true, PA_FLIP_LR);
+  applyDisplayOrientation();
 
   // Ensure bars are off at boot
   updateBackgroundBars(false, false);
@@ -1572,31 +1803,8 @@ void setup() {
 
   if (startupAction == STARTUP_WIFI_AP) {
     Serial.println("[Setup] Opening WiFi AP from setup menu");
-    eepromWriteBootCounter(0);
     startConfigPortal();
     ESP.restart();
-  }
-
-  // --------------------------------------------------------
-  // Simplified boot counter logic:
-  //  - 0 → Hello! → write 1
-  //  - 1 → CFG ! → write 0
-  //  - Hello! timeout → write 0
-  // --------------------------------------------------------
-  bootCountCached = eepromReadBootCounter();
-  Serial.printf("[Boot] Boot counter read: %u\n", bootCountCached);
-  
-  if (bootCountCached == 1 && startupAction != STARTUP_WEB_CONFIG) {
-    // Boot counter 1 → trigger config portal
-    Serial.println("[Boot] Boot counter 1 → triggering config portal");
-    eepromWriteBootCounter(0);  // Reset immediately
-    bootCountCached = 0;
-    startConfigPortal();
-    ESP.restart();
-  } else {
-    // Boot counter 0 (or any other value) → normal boot with Hello!
-    Serial.println("[Boot] Boot counter 0 → normal boot with Hello!");
-    eepromWriteBootCounter(1);  // Set to 1 for next boot trigger
   }
 
   // Show "Hello!" for 3 seconds
@@ -1616,11 +1824,6 @@ void setup() {
   P.displayClear();
   currentText = "";
   
-  // Hello! timeout → reset boot counter to 0
-  eepromWriteBootCounter(0);
-  bootCountCached = 0;
-  Serial.println("[Boot] Hello! timeout - boot counter reset to 0");
-
   // WiFi + config
   connectToNetwork();
 
@@ -1650,6 +1853,8 @@ void loop() {
 
   // Handle REST API requests
   restServer.handleClient();
+  wifiManager.process();
+  handleSerialProvisioning();
 
   // Attempt Companion connection if not connected
   if (!client.connected() && (now - lastConnectTry >= connectRetryMs)) {
@@ -1693,14 +1898,30 @@ void loop() {
     Serial.println("[Display] Showing Connecting... after 1s delay");
   }
 
+  // A TCP socket can survive while Companion has discarded the old Satellite
+  // session. If no protocol data arrives, reconnect instead of remaining in a
+  // connected-but-unresponsive state indefinitely.
+  if (client.connected() && !connectionEstablished && connectionStartTime > 0 &&
+      (now - connectionStartTime >= companionHandshakeTimeout)) {
+    Serial.println("[NET] Companion handshake timed out; reconnecting");
+    client.stop();
+    connectionStartTime = 0;
+    connectingMessageShown = false;
+    lastConnectTry = 0;
+  }
+
   // Handle Companion traffic
   if (client.connected()) {
     while (client.available()) {
       String line = client.readStringUntil('\n');
       line.trim();
       if (line.length() > 0) {
-        // Mark connection as established and stop showing Connecting...
-        if (!connectionEstablished) {
+        // Heartbeats only prove that the TCP socket is alive. Wait for an
+        // actual display command before considering Satellite registration
+        // complete, otherwise a stale session can remain unresponsive.
+        const bool displayCommand = line.startsWith("KEY-STATE") ||
+          line.startsWith("KEYS-CLEAR") || line.startsWith("BRIGHTNESS");
+        if (!connectionEstablished && displayCommand) {
           connectionEstablished = true;
           connectingMessageShown = false;
           Serial.println("[Display] Connection established - stopping Connecting...");
@@ -1777,17 +1998,11 @@ void loop() {
     setTextNow(pendingText);
   }
 
-  // Let Parola do its thing
-  if (P.displayAnimate()) {
-    // Only auto-reset for scrolling animations.
-    // For static text (PRINT), leave it alone so it doesn’t flash.
-    if (textScrolls) {
-      P.displayReset();
-    }
-
-    // Re-apply bars each animation step in bar modes - only when Companion is connected
-    if (client.connected() && (bgMode == BG_BARS || bgMode == BG_PGMPVW || bgMode == BG_PVWPGM)) {
-      updateBackgroundBars(barLeftOn, barRightOn);
-    }
+  // Static PRINT output is already complete, so do not ask Parola to repaint it.
+  // Scrolling remains under Parola's normal update path; the edge bars are
+  // restored after each completed animation step.
+  if (textScrolls && P.displayAnimate()) {
+    P.displayReset();
+    if (barsNeedOverlay()) updateBackgroundBars(barLeftOn, barRightOn);
   }
 }
