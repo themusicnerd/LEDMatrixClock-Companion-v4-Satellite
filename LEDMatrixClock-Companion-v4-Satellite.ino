@@ -45,7 +45,7 @@
 #include <MD_Parola.h>
 #include <MD_MAX72xx.h>
 
-const char* FIRMWARE_VERSION = "1.4.3";
+const char* FIRMWARE_VERSION = "1.4.4";
 #include <SPI.h>
 #include <vector>
 #include <ESP8266mDNS.h>
@@ -161,6 +161,8 @@ WiFiManagerParameter* custom_bgMode;     // background handling mode
 
 // Device ID and hostname
 String deviceID;
+String configuredDeviceName;
+String serialProvisionBuffer;
 bool mdnsStarted = false;
 
 // GPIO0 is a boot strap pin: holding DOWNLOAD while resetting starts the
@@ -186,6 +188,8 @@ const uint16_t EEPROM_SIZE      = 128;
 const uint16_t EEPROM_STARTUP_ACTION_ADDR = 67;
 const uint16_t EEPROM_ORIENTATION_ADDR = 68;
 const uint16_t EEPROM_SCROLL_DELAY_ADDR = 69;
+const uint16_t EEPROM_DEVICE_NAME_ADDR = 102;
+const uint8_t EEPROM_DEVICE_NAME_LENGTH = 26;
 
 enum StartupAction : uint8_t {
   STARTUP_NORMAL = 0,
@@ -283,6 +287,15 @@ void eepromLoadCompanionConfig() {
     }
   }
   firmwareUpdatePassword = String(updatePassword);
+  char savedDeviceName[EEPROM_DEVICE_NAME_LENGTH] = {};
+  if (EEPROM.read(EEPROM_DEVICE_NAME_ADDR) != 0xFF) {
+    for (uint8_t i = 0; i < EEPROM_DEVICE_NAME_LENGTH - 1; ++i) {
+      const uint8_t savedByte = EEPROM.read(EEPROM_DEVICE_NAME_ADDR + i);
+      if (savedByte == 0 || savedByte == 0xFF) break;
+      savedDeviceName[i] = static_cast<char>(savedByte);
+    }
+  }
+  configuredDeviceName = String(savedDeviceName);
   if (EEPROM.read(0) == 'L' && EEPROM.read(1) == 'M') {
     // Valid header
     for (int i = 0; i < 40; i++) {
@@ -358,6 +371,10 @@ void eepromSaveCompanionConfig(const char* host, const char* port) {
   EEPROM.write(66, (uint8_t)brightness);
   EEPROM.write(EEPROM_ORIENTATION_ADDR, static_cast<uint8_t>(displayOrientation));
   EEPROM.write(EEPROM_SCROLL_DELAY_ADDR, static_cast<uint8_t>(scrollDelayMs));
+  for (uint8_t i = 0; i < EEPROM_DEVICE_NAME_LENGTH; ++i) {
+    const char c = i < configuredDeviceName.length() ? configuredDeviceName[i] : 0;
+    EEPROM.write(EEPROM_DEVICE_NAME_ADDR + i, static_cast<uint8_t>(c));
+  }
 
   EEPROM.commit();
   EEPROM.end();
@@ -1223,6 +1240,7 @@ void connectToNetwork() {
   // -----------------------------------------------------------------------
 
   // Normal autoConnect behaviour (connect to WiFi, or start portal if no WiFi)
+  wifiManager.setConfigPortalBlocking(false);
   // Show "WiFi" during connection attempt
   showBootMessage("WiFi ?");
   
@@ -1288,6 +1306,46 @@ String jsonSetting(const String& body, const char* name) {
   String value = body.substring(pos, end); value.trim(); return value;
 }
 
+void handleSerialProvisioning() {
+  while (Serial.available()) {
+    const char c = Serial.read();
+    if (c == '\n') {
+      serialProvisionBuffer.trim();
+      if (serialProvisionBuffer.startsWith("PROVISION ")) {
+        const String body = serialProvisionBuffer.substring(10);
+        const String ssid = jsonSetting(body, "ssid"), password = jsonSetting(body, "password");
+        const String host = jsonSetting(body, "companionHost"), port = jsonSetting(body, "companionPort"), name = jsonSetting(body, "deviceName");
+        if (port.length() && (port.toInt() < 1 || port.toInt() > 65535)) Serial.println("PROVISION-ERROR invalid companionPort");
+        else {
+          if (host.length()) host.toCharArray(companion_host, sizeof(companion_host));
+          if (port.length()) port.toCharArray(companion_port, sizeof(companion_port));
+          if (name.length()) configuredDeviceName = name.substring(0, EEPROM_DEVICE_NAME_LENGTH - 1);
+          eepromSaveCompanionConfig(companion_host, companion_port);
+          Serial.println("PROVISION-OK");
+          if (ssid.length()) { delay(100); WiFi.persistent(true); WiFi.begin(ssid.c_str(), password.c_str()); }
+        }
+      }
+      serialProvisionBuffer = "";
+    } else if (c != '\r' && serialProvisionBuffer.length() < 512) serialProvisionBuffer += c;
+  }
+}
+
+void handlePostHardwareTest() {
+  const String target = jsonSetting(restServer.arg("plain"), "target");
+  const String value = jsonSetting(restServer.arg("plain"), "value");
+  if (target == "text" && value.length()) {
+    setText(value.substring(0, sizeof(matrixText) - 1));
+  } else if (target == "display" && value == "white") {
+    P.getGraphicObject()->control(MD_MAX72XX::TEST, MD_MAX72XX::ON);
+  } else if (target == "display" && value == "off") {
+    P.getGraphicObject()->control(MD_MAX72XX::TEST, MD_MAX72XX::OFF);
+    P.displayClear();
+  } else {
+    restServer.send(400, "text/plain", "Use display white/off or provide text"); return;
+  }
+  restServer.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleGetSettings() {
   const String json = "{\"mode\":\"" + String(bg_mode_str) + "\",\"orientation\":\"" +
     String(displayOrientationName()) + "\",\"brightness\":" + String(brightness) +
@@ -1320,8 +1378,8 @@ String statusJsonEscape(String value) {
 }
 
 void handleStatus() {
-  String json = "{\"deviceName\":\"LED Matrix Clock\",\"firmwareVersion\":\"" +
-    String(FIRMWARE_VERSION) + "\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
+  String json = "{\"deviceName\":\"" + statusJsonEscape(configuredDeviceName.length() ? configuredDeviceName : "LED Matrix Clock") + "\",\"firmwareVersion\":\"" +
+    String(FIRMWARE_VERSION) + "\",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",\"deviceId\":\"" + statusJsonEscape(deviceID) + "\",";
   json += "\"network\":\"wifi\",\"networkConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
   json += "\"ssid\":\"" + statusJsonEscape(WiFi.SSID()) + "\",\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"companionConnected\":" + String(client.connected() ? "true" : "false") + ",";
@@ -1329,7 +1387,7 @@ void handleStatus() {
   json += "\"text\":\"" + statusJsonEscape(currentText) + "\",\"mode\":\"" + String(bg_mode_str) +
     "\",\"orientation\":\"" + String(displayOrientationName()) + "\",\"compactClock\":" +
     String(isCompactClockText(currentText) ? "true" : "false") + ",\"brightness\":" + String(brightness) +
-    ",\"scrollDelayMs\":" + String(scrollDelayMs) + ",";
+    ",\"scrollDelayMs\":" + String(scrollDelayMs) + ",\"buttonPressed\":" + String(digitalRead(PIN_DOWNLOAD) == LOW ? "true" : "false") + ",";
   json += "\"color\":{\"valid\":" + String(lastColorValid ? "true" : "false") + ",\"r\":" +
     String(lastColorR) + ",\"g\":" + String(lastColorG) + ",\"b\":" + String(lastColorB) + "},";
   json += "\"uptimeSeconds\":" + String(millis() / 1000) + "}";
@@ -1347,9 +1405,12 @@ void handleDashboard() {
     "<label>Orientation <select id=dm><option value=0>0 degrees - normal</option><option value=180>180 degrees</option><option value=90cw>90 CW - mirror</option><option value=90ccw>90 CCW - flip / mirror</option></select></label><br>"
     "<label>Brightness <input id=br type=number min=0 max=100></label><br>"
     "<label>Scroll step delay <input id=sd type=number min=10 max=250> ms <small>(lower is faster; default 40)</small></label> <button onclick=v()>Save display settings</button><div id=o></div>"
-    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function cg(){let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ch.value.trim(),port:+cp.value})});co.textContent=await r.text();loaded=false}async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function u(){try{let x=await(await fetch('/api/status')).json();"
+    "<h3>Hardware tests</h3><p>DOWNLOAD button: <strong id=bt>released</strong></p>"
+    "<p><button onclick=tt('display','white')>All pixels on</button> <button onclick=tt('display','off')>Display off</button></p>"
+    "<p><input id=tx maxlength=95 placeholder='Matrix test text'><button onclick=tt('text',tx.value)>Show text</button></p>"
+    "<p><a href=/update>Firmware update</a></p><pre id=j></pre><script>let loaded=false;async function cg(){let r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:ch.value.trim(),port:+cp.value})});co.textContent=await r.text();loaded=false}async function v(){let r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:bm.value,orientation:dm.value,brightness:+br.value,scrollDelayMs:+sd.value})});o.textContent=await r.text();loaded=false}async function tt(target,value){let r=await fetch('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,value})});j.textContent=await r.text()}async function u(){try{let x=await(await fetch('/api/status')).json();"
     "s.textContent='Firmware v'+x.firmwareVersion+' | '+(x.networkConnected?'Network connected':'Network disconnected')+' | '+(x.companionConnected?'Companion connected':'Companion disconnected')+' | '+x.ip+' | Mode '+x.mode+' | Orientation '+x.orientation;"
-    "t.textContent=x.text||'(none)';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
+    "t.textContent=x.text||'(none)';bt.textContent=x.buttonPressed?'PRESSED':'released';let q=x.color;c.textContent=`rgb(${q.r}, ${q.g}, ${q.b})`;w.style.background=`rgb(${q.r},${q.g},${q.b})`;"
     "if(!loaded){let g=await(await fetch('/api/config')).json();ch.value=g.host;cp.value=g.port;bm.value=x.mode;dm.value=x.orientation;br.value=x.brightness;sd.value=x.scrollDelayMs;loaded=true}j.textContent=JSON.stringify(x,null,2)}catch(e){s.textContent='Status unavailable'}}u();setInterval(u,2000)</script>");
 }
 
@@ -1619,6 +1680,7 @@ void setupRestAPI() {
   restServer.on("/api/port", HTTP_POST, handlePostPort);
   restServer.on("/api/config", HTTP_POST, handlePostConfig);
   restServer.on("/api/settings", HTTP_POST, handlePostSettings);
+  restServer.on("/api/test", HTTP_POST, handlePostHardwareTest);
   restServer.on("/update", HTTP_GET, handleFirmwareUpdatePage);
   restServer.on("/update", HTTP_POST, handleFirmwareUpdateResult, handleFirmwareUpload);
   restServer.on("/update/password", HTTP_POST, handleFirmwareUpdatePassword);
@@ -1791,6 +1853,8 @@ void loop() {
 
   // Handle REST API requests
   restServer.handleClient();
+  wifiManager.process();
+  handleSerialProvisioning();
 
   // Attempt Companion connection if not connected
   if (!client.connected() && (now - lastConnectTry >= connectRetryMs)) {
